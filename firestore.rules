@@ -1,0 +1,113 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    
+    function isStatus(status) {
+      return isAuthenticated() && getUserData().status == status;
+    }
+    
+    function hasRole(role) {
+      return isAuthenticated() && getUserData().role == role;
+    }
+
+    function isAdmin() {
+      return (isAuthenticated() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && getUserData().role == 'admin' && getUserData().status == 'ATIVO') ||
+             (isAuthenticated() && request.auth.token.email == "marquesluso.brasileiro@gmail.com" && request.auth.token.email_verified == true);
+    }
+
+    function isSupervisor() {
+      return (hasRole('supervisor') && isStatus('ATIVO')) || isAdmin();
+    }
+
+    function isAgent() {
+      return (hasRole('agent') && isStatus('ATIVO')) || isAdmin();
+    }
+    
+    function isAtivo() {
+      return isStatus('ATIVO') || isAdmin();
+    }
+
+    // User profiles
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      // Allow creation for PENDENTE status during registration or by admin
+      allow create: if (isAuthenticated() && request.auth.uid == userId && request.resource.data.status == 'PENDENTE') || isAdmin();
+      // Only admin can update status or roles. Users can update their own non-sensitive data.
+      allow update: if isAdmin() || (isAuthenticated() && request.auth.uid == userId && 
+        request.resource.data.role == resource.data.role && 
+        request.resource.data.status == resource.data.status);
+      allow delete: if isAdmin();
+    }
+
+    // Public Properties
+    match /properties/{propertyId} {
+      allow read: if isAtivo();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Patrol logs
+    match /patrols/{patrolId} {
+      allow read: if isAtivo();
+      allow create: if isAtivo();
+      allow update, delete: if isAdmin();
+    }
+
+    // Occurrences
+    match /occurrences/{occurrenceId} {
+      allow read: if isAtivo();
+      allow create: if isAtivo();
+      allow update, delete: if isAdmin();
+    }
+
+    // Teams
+    match /teams/{teamId} {
+      allow read: if isAtivo();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Vehicles
+    match /vehicles/{vehicleId} {
+      allow read: if isAtivo();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Vehicle Locations (Real-time tracking)
+    match /vehicle_locations/{locationId} {
+      allow read: if isSupervisor();
+      // Agents can update their own location
+      allow create, update: if isAgent();
+      allow delete: if isAdmin();
+    }
+
+    // Geofences
+    match /geofences/{geofenceId} {
+      allow read: if isAtivo();
+      allow create, update, delete: if isAdmin();
+    }
+
+    // Operational Alerts
+    match /alerts/{alertId} {
+      allow read: if isSupervisor();
+      // System or agents can create alerts
+      allow create: if isAtivo();
+      // Only supervisors/admins can resolve alerts
+      allow update: if isSupervisor();
+      allow delete: if isAdmin();
+    }
+    
+    // Audit Logs
+    match /audit_logs/{logId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin();
+      allow update, delete: if false;
+    }
+  }
+}

@@ -1,0 +1,5 @@
+{
+  "name": "SIGMA-GCM",
+  "description": "Sistema Inteligente de Gestão e Monitoramento Avançado para a Guarda Civil Municipal.",
+  "requestFramePermissions": ["camera", "geolocation", "publickey-credentials-get", "publickey-credentials-create"]
+}

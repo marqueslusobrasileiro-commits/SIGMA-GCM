@@ -1,0 +1,220 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "System users (GCM agents, supervisors, admins).",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string" },
+        "name": { "type": "string" },
+        "registration": { "type": "string" },
+        "role": { "type": "string", "enum": ["agent", "supervisor", "admin"] },
+        "status": { "type": "string", "enum": ["PENDENTE", "ATIVO", "BLOQUEADO"] },
+        "email": { "type": "string", "format": "email" },
+        "teamId": { "type": "string" },
+        "vehicleId": { "type": "string" },
+        "biometricEnabled": { "type": "boolean" },
+        "failedAttempts": { "type": "number" },
+        "lockedUntil": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "name", "registration", "role", "status"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Administrative action logs.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "adminId": { "type": "string" },
+        "adminName": { "type": "string" },
+        "action": { "type": "string" },
+        "details": { "type": "string" },
+        "targetId": { "type": "string" },
+        "targetType": { "type": "string", "enum": ["user", "property", "vehicle", "team"] },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["adminId", "adminName", "action", "details", "timestamp"]
+    },
+    "Team": {
+      "title": "Team",
+      "description": "Operational teams (Alfa, Bravo, ROMU, etc.) with full composition.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "shift": { "type": "string", "enum": ["Manhã", "Tarde", "Noite"] },
+        "vehicleId": { "type": "string" },
+        "vehiclePrefix": { "type": "string" },
+        "driver": { "type": "string" },
+        "inCharge": { "type": "string" },
+        "aux1": { "type": "string" },
+        "aux2": { "type": "string" },
+        "agentIds": { "type": "array", "items": { "type": "string" } },
+        "active": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["name", "shift", "vehicleId", "driver", "inCharge"]
+    },
+    "Vehicle": {
+      "title": "Vehicle",
+      "description": "GCM vehicles (viaturas).",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "prefix": { "type": "string" },
+        "plate": { "type": "string" },
+        "model": { "type": "string" },
+        "type": { "type": "string", "enum": ["Motorizada", "Moto", "Base móvel", "Tática"] },
+        "status": { "type": "string", "enum": ["Em serviço", "Em manutenção", "Reserva"] }
+      },
+      "required": ["prefix", "plate", "model", "type", "status"]
+    },
+    "PublicProperty": {
+// ...
+      "required": ["id", "name", "latitude", "longitude", "qrCode"]
+    },
+    "Patrol": {
+      "title": "Patrol",
+      "description": "Patrol records (rondas).",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "agentId": { "type": "string" },
+        "agentName": { "type": "string" },
+        "teamId": { "type": "string" },
+        "teamName": { "type": "string" },
+        "vehicleId": { "type": "string" },
+        "vehiclePrefix": { "type": "string" },
+        "driver": { "type": "string" },
+        "inCharge": { "type": "string" },
+        "aux1": { "type": "string" },
+        "aux2": { "type": "string" },
+        "propertyId": { "type": "string" },
+        "propertyName": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "latitude": { "type": "number" },
+        "longitude": { "type": "number" },
+        "status": { "type": "string", "enum": ["normal", "attention", "urgent"] },
+        "observation": { "type": "string" },
+        "photoUrl": { "type": "string" }
+      },
+      "required": ["agentId", "propertyId", "timestamp", "latitude", "longitude", "teamId", "vehicleId", "driver", "inCharge"]
+    },
+    "Occurrence": {
+      "title": "Occurrence",
+      "description": "Operational occurrences registered by agents.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "agentId": { "type": "string" },
+        "agentName": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "description": { "type": "string" },
+        "type": { "type": "string" },
+        "latitude": { "type": "number" },
+        "longitude": { "type": "number" },
+        "photoUrl": { "type": "string" }
+      },
+      "required": ["agentId", "timestamp", "description"]
+    },
+    "BiometricCredential": {
+      "title": "BiometricCredential",
+      "description": "WebAuthn credentials stored for a user.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "publicKey": { "type": "string" },
+        "counter": { "type": "number" },
+        "deviceType": { "type": "string" },
+        "backedUp": { "type": "boolean" },
+        "transports": { "type": "array", "items": { "type": "string" } }
+      },
+      "required": ["id", "userId", "publicKey", "counter"]
+    },
+    "LoginLog": {
+      "title": "LoginLog",
+      "description": "Audit logs for user logins.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "userName": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "type": { "type": "string", "enum": ["Senha", "Biometria"] },
+        "device": { "type": "string" },
+        "success": { "type": "boolean" }
+      },
+      "required": ["userId", "userName", "timestamp", "type", "device"]
+    },
+    "VehicleLocation": {
+      "title": "VehicleLocation",
+      "description": "Real-time GPS tracking for vehicles.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "vehicleId": { "type": "string" },
+        "vehiclePrefix": { "type": "string" },
+        "teamId": { "type": "string" },
+        "teamName": { "type": "string" },
+        "driver": { "type": "string" },
+        "inCharge": { "type": "string" },
+        "latitude": { "type": "number" },
+        "longitude": { "type": "number" },
+        "speed": { "type": "number" },
+        "status": { "type": "string", "enum": ["patrolling", "moving", "occurrence", "offline"] },
+        "lastUpdate": { "type": "string", "format": "date-time" },
+        "idleTimeMinutes": { "type": "number" }
+      },
+      "required": ["vehicleId", "vehiclePrefix", "latitude", "longitude", "status", "lastUpdate"]
+    },
+    "Geofence": {
+      "title": "Geofence",
+      "description": "Electronic fences for critical areas.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "type": { "type": "string", "enum": ["critical", "sensitive", "restricted"] },
+        "coordinates": { "type": "array", "items": { "type": "array", "items": { "type": "number" } } },
+        "active": { "type": "boolean" }
+      },
+      "required": ["name", "type", "coordinates", "active"]
+    },
+    "OperationalAlert": {
+      "title": "OperationalAlert",
+      "description": "Intelligent operational alerts.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "type": { "type": "string", "enum": ["geofence", "idle", "unvisited", "radius", "security"] },
+        "severity": { "type": "string", "enum": ["low", "medium", "high", "critical"] },
+        "title": { "type": "string" },
+        "message": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" },
+        "targetId": { "type": "string" },
+        "targetName": { "type": "string" },
+        "resolved": { "type": "boolean" },
+        "resolvedBy": { "type": "string" },
+        "resolvedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["type", "severity", "title", "message", "timestamp", "resolved"]
+    }
+  },
+  "firestore": {
+    "users": { "schema": "User", "description": "User profiles and roles." },
+    "credentials": { "schema": "BiometricCredential", "description": "Stored biometric credentials." },
+    "login_logs": { "schema": "LoginLog", "description": "Audit trails for logins." },
+    "properties": { "schema": "PublicProperty", "description": "List of municipal properties." },
+    "patrols": { "schema": "Patrol", "description": "Patrol logs." },
+    "occurrences": { "schema": "Occurrence", "description": "Registered occurrences." },
+    "teams": { "schema": "Team", "description": "Operational teams." },
+    "vehicles": { "schema": "Vehicle", "description": "GCM vehicles." },
+    "audit_logs": { "schema": "AuditLog", "description": "Administrative audit trails." },
+    "vehicle_locations": { "schema": "VehicleLocation", "description": "Real-time vehicle tracking data." },
+    "geofences": { "schema": "Geofence", "description": "Electronic fence definitions." },
+    "alerts": { "schema": "OperationalAlert", "description": "Operational alerts and notifications." }
+  }
+}
