@@ -13,6 +13,7 @@
         "email": { "type": "string", "format": "email" },
         "teamId": { "type": "string" },
         "vehicleId": { "type": "string" },
+        "photoUrl": { "type": "string" },
         "biometricEnabled": { "type": "boolean" },
         "failedAttempts": { "type": "number" },
         "lockedUntil": { "type": "string", "format": "date-time" },

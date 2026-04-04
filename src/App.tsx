@@ -727,69 +727,248 @@ function App() {
   }, [user, profile, geofences.length]);
 
   const generateEndOfShiftReport = async () => {
-    if (!profile) return;
-    
-    const doc = new jsPDF();
-    const now = new Date();
-    
-    // Header
-    doc.setFillColor(15, 44, 99); // Azul institucional (#0f2c63)
-    doc.rect(0, 0, 210, 40, 'F');
-    doc.setTextColor(255, 255, 255);
-    doc.setFontSize(22);
-    doc.text('SIGMA-GCM', 105, 20, { align: 'center' });
-    doc.setFontSize(14);
-    doc.text('RELATÓRIO DE ENCERRAMENTO DE PLANTÃO', 105, 30, { align: 'center' });
-    
-    doc.setTextColor(0, 0, 0);
-    doc.setFontSize(10);
-    doc.text(`Data: ${format(now, 'dd/MM/yyyy')}`, 15, 50);
-    doc.text(`Hora: ${format(now, 'HH:mm')}`, 15, 55);
-    doc.text(`Responsável: ${profile.name}`, 15, 60);
-    doc.text(`Viatura: ${profile.vehiclePrefix || 'N/A'}`, 15, 65);
-    
-    // Summary Stats
-    const todayPatrols = patrols.filter(p => isToday(new Date(p.timestamp)));
-    const todayOccurrences = occurrences.filter(o => isToday(new Date(o.timestamp)));
-    
-    autoTable(doc, {
-      startY: 75,
-      head: [['Indicador', 'Quantidade']],
-      body: [
-        ['Total de Rondas Realizadas', todayPatrols.length.toString()],
-        ['Ocorrências Registradas', todayOccurrences.length.toString()],
-        ['Próprios Públicos Visitados', new Set(todayPatrols.map(p => p.propertyId)).size.toString()],
-      ],
-      theme: 'striped',
-      headStyles: { fillColor: [15, 44, 99] }
-    });
-    
-    // Patrols Table
-    doc.setFontSize(12);
-    doc.text('Detalhamento de Rondas', 15, (doc as any).lastAutoTable.finalY + 15);
-    
-    autoTable(doc, {
-      startY: (doc as any).lastAutoTable.finalY + 20,
-      head: [['Hora', 'Local', 'Status', 'Observação']],
-      body: todayPatrols.map(p => [
+    if (!profile) {
+      alert('Perfil não carregado.');
+      return;
+    }
+
+    try {
+      const pdfDoc = new jsPDF();
+      const today = new Date();
+      
+      const todayPatrols = patrols.filter(p => {
+        try {
+          return isToday(new Date(p.timestamp)) && p.teamId === profile?.teamId;
+        } catch (e) {
+          return false;
+        }
+      }).sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+      const todayOccurrences = occurrences.filter(o => {
+        try {
+          return isToday(new Date(o.timestamp));
+        } catch (e) {
+          return false;
+        }
+      }).sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+
+      // Fetch the latest team data directly from Firestore to ensure it's up to date
+      let team: Team | undefined = undefined;
+      if (profile?.teamId) {
+        try {
+          // Force fetch from server to avoid cached stale data
+          const teamDoc = await getDocFromServer(doc(db, 'teams', profile.teamId));
+          if (teamDoc.exists()) {
+            team = { id: teamDoc.id, ...teamDoc.data() } as Team;
+          }
+        } catch (e) {
+          console.error("Error fetching latest team data for report:", e);
+          // Fallback to local state if fetch fails
+          team = teams.find(t => t.id === profile.teamId);
+        }
+      }
+
+      // Function to load image and convert to base64 for jsPDF
+      const loadImage = (url: string): Promise<string> => {
+        return new Promise((resolve, reject) => {
+          const img = new Image();
+          img.crossOrigin = 'Anonymous';
+          img.onload = () => {
+            const canvas = document.createElement('canvas');
+            canvas.width = img.width;
+            canvas.height = img.height;
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+              ctx.drawImage(img, 0, 0);
+              resolve(canvas.toDataURL('image/jpeg', 0.7));
+            } else {
+              reject(new Error('Could not get canvas context'));
+            }
+          };
+          img.onerror = (e) => reject(e);
+          img.src = url;
+        });
+      };
+
+      // Header
+      pdfDoc.setFillColor(15, 44, 99);
+      pdfDoc.rect(0, 0, 210, 45, 'F');
+      
+      // Logo Placeholder
+      pdfDoc.setDrawColor(255, 255, 255);
+      pdfDoc.setLineWidth(0.5);
+      if (profile?.photoUrl) {
+        try {
+          const profileImg = await loadImage(profile.photoUrl);
+          pdfDoc.addImage(profileImg, 'JPEG', 20, 10, 25, 25);
+          pdfDoc.circle(32.5, 22.5, 12.5, 'S');
+        } catch (e) {
+          pdfDoc.circle(30, 22, 12, 'S');
+          pdfDoc.setFontSize(8);
+          pdfDoc.setTextColor(255, 255, 255);
+          pdfDoc.text('GCM', 30, 24, { align: 'center' });
+        }
+      } else {
+        pdfDoc.circle(30, 22, 12, 'S');
+        pdfDoc.setFontSize(8);
+        pdfDoc.setTextColor(255, 255, 255);
+        pdfDoc.text('GCM', 30, 24, { align: 'center' });
+      }
+
+      pdfDoc.setTextColor(255, 255, 255);
+      pdfDoc.setFontSize(24);
+      pdfDoc.setFont('helvetica', 'bold');
+      pdfDoc.text('SIGMA-GCM', 105, 15, { align: 'center' });
+      
+      pdfDoc.setFontSize(9);
+      pdfDoc.setFont('helvetica', 'italic');
+      pdfDoc.text('Sistema Inteligente de Gestão e Monitoramento Avançado da Guarda Civil Municipal', 105, 21, { align: 'center' });
+      
+      pdfDoc.setFontSize(14);
+      pdfDoc.setFont('helvetica', 'normal');
+      pdfDoc.text('Relatório Operacional de Plantão', 105, 31, { align: 'center' });
+      
+      pdfDoc.setFontSize(9);
+      pdfDoc.text(`Gerado em: ${format(new Date(), 'dd/MM/yyyy HH:mm')}`, 105, 40, { align: 'center' });
+
+      // Info Section
+      pdfDoc.setTextColor(0, 0, 0);
+      pdfDoc.setFontSize(11);
+      pdfDoc.setFont('helvetica', 'bold');
+      pdfDoc.text('DADOS DO PLANTÃO', 20, 55);
+      pdfDoc.line(20, 57, 190, 57);
+
+      pdfDoc.setFontSize(10);
+      pdfDoc.setFont('helvetica', 'normal');
+      pdfDoc.text(`Agente Responsável: ${profile?.name || 'N/A'}`, 20, 65);
+      pdfDoc.text(`Matrícula: ${profile?.registration || 'N/A'}`, 20, 72);
+      pdfDoc.text(`Data do Plantão: ${format(today, 'dd/MM/yyyy')}`, 20, 79);
+
+      pdfDoc.text(`Viatura: ${team?.vehiclePrefix || 'N/A'}`, 110, 65);
+      pdfDoc.text(`Equipe: ${team?.name || 'N/A'}`, 110, 72);
+      pdfDoc.text(`Turno: ${team?.shift || 'N/A'}`, 110, 79);
+
+      // Composition Section
+      pdfDoc.setFont('helvetica', 'bold');
+      pdfDoc.text('COMPOSIÇÃO DA EQUIPE', 20, 92);
+      pdfDoc.line(20, 94, 190, 94);
+
+      pdfDoc.setFont('helvetica', 'normal');
+      pdfDoc.text(`Condutor: ${team?.driver || 'N/A'}`, 20, 102);
+      pdfDoc.text(`Encarregado: ${team?.inCharge || 'N/A'}`, 20, 109);
+      pdfDoc.text(`Auxiliar 01: ${team?.aux1 || '-'}`, 110, 102);
+      pdfDoc.text(`Auxiliar 02: ${team?.aux2 || '-'}`, 110, 109);
+
+      if (team?.members && team.members.length > 0) {
+        pdfDoc.text(`Membros Adicionais: ${team.members.join(', ')}`, 20, 116);
+      }
+
+      // Patrols Table
+      pdfDoc.setFont('helvetica', 'bold');
+      pdfDoc.text('HISTÓRICO DE RONDAS', 20, 125);
+      
+      const patrolTableData = todayPatrols.map(p => [
         format(new Date(p.timestamp), 'HH:mm'),
         p.propertyName,
-        p.status.toUpperCase(),
+        p.plusCode || '-',
+        p.status?.toUpperCase() || 'NORMAL',
         p.observation || '-'
-      ]),
-      styles: { fontSize: 8 },
-      headStyles: { fillColor: [15, 44, 99] }
-    });
-    
-    // Signatures
-    const finalY = (doc as any).lastAutoTable.finalY + 40;
-    doc.line(20, finalY, 90, finalY);
-    doc.text('Assinatura do Encarregado', 30, finalY + 5);
-    
-    doc.line(120, finalY, 190, finalY);
-    doc.text('Visto do Supervisor', 140, finalY + 5);
-    
-    doc.save(`SIGMA_Relatorio_Plantao_${format(now, 'yyyyMMdd_HHmm')}.pdf`);
+      ]);
+
+      autoTable(pdfDoc, {
+        startY: 130,
+        head: [['Horário', 'Local / Próprio Público', 'Plus Code', 'Status', 'Observações']],
+        body: patrolTableData,
+        headStyles: { fillColor: [0, 33, 71] },
+        styles: { fontSize: 8 },
+        margin: { left: 20, right: 20 }
+      });
+
+      // Summary
+      let finalY = (pdfDoc as any).lastAutoTable.finalY + 15;
+      pdfDoc.setFont('helvetica', 'bold');
+      pdfDoc.text(`Total de locais visitados: ${todayPatrols.length}`, 20, finalY);
+
+      // Occurrences Section
+      finalY += 15;
+      
+      if (todayOccurrences.length > 0) {
+        if (finalY > 250) {
+          pdfDoc.addPage();
+          finalY = 20;
+        }
+        
+        pdfDoc.setFont('helvetica', 'bold');
+        pdfDoc.text('OCORRÊNCIAS REGISTRADAS', 20, finalY);
+        
+        const occurrenceTableData = todayOccurrences.map(o => [
+          format(new Date(o.timestamp), 'HH:mm'),
+          o.propertyName || 'N/A',
+          o.type,
+          o.description
+        ]);
+
+        autoTable(pdfDoc, {
+          startY: finalY + 5,
+          head: [['Horário', 'Local / Posto', 'Tipo de Ocorrência', 'Descrição / Relato']],
+          body: occurrenceTableData,
+          headStyles: { fillColor: [153, 0, 0] }, // Dark red
+          styles: { fontSize: 9 },
+          margin: { left: 20, right: 20 }
+        });
+        
+        finalY = (pdfDoc as any).lastAutoTable.finalY + 15;
+
+        // Add Photos if any
+        const occurrencesWithPhotos = todayOccurrences.filter(o => o.photoUrl);
+        if (occurrencesWithPhotos.length > 0) {
+          if (finalY > 200) {
+            pdfDoc.addPage();
+            finalY = 20;
+          }
+          pdfDoc.setFont('helvetica', 'bold');
+          pdfDoc.text('ANEXOS FOTOGRÁFICOS (OCORRÊNCIAS)', 20, finalY);
+          finalY += 10;
+
+          for (const occ of occurrencesWithPhotos) {
+            if (finalY > 230) {
+              pdfDoc.addPage();
+              finalY = 20;
+            }
+            pdfDoc.setFont('helvetica', 'normal');
+            pdfDoc.setFontSize(8);
+            pdfDoc.text(`${format(new Date(occ.timestamp), 'HH:mm')} - ${occ.type} (${occ.propertyName || 'N/A'})`, 20, finalY);
+            finalY += 5;
+            try {
+              const imgData = await loadImage(occ.photoUrl!);
+              pdfDoc.addImage(imgData, 'JPEG', 20, finalY, 60, 45);
+              finalY += 55;
+            } catch (e) {
+              console.error('Error adding image to PDF:', e);
+              pdfDoc.text('[Erro ao carregar imagem]', 20, finalY);
+              finalY += 10;
+            }
+          }
+        }
+      } else {
+        finalY += 10;
+        pdfDoc.setFont('helvetica', 'italic');
+        pdfDoc.text('Nenhuma ocorrência registrada neste plantão.', 20, finalY);
+        finalY += 20;
+      }
+
+      pdfDoc.line(60, finalY + 10, 150, finalY + 10);
+      pdfDoc.setFont('helvetica', 'normal');
+      pdfDoc.setFontSize(10);
+      pdfDoc.text('Assinatura do Agente Responsável', 105, finalY + 18, { align: 'center' });
+      pdfDoc.text(`${profile?.name} - GCM`, 105, finalY + 25, { align: 'center' });
+
+      pdfDoc.save(`Relatorio_Plantao_${profile?.registration || 'GCM'}_${format(today, 'yyyyMMdd')}.pdf`);
+      alert('Relatório gerado com sucesso!');
+    } catch (err) {
+      console.error('Erro ao gerar relatório:', err);
+      alert('Erro ao gerar relatório PDF.');
+    }
   };
 
   const handleResolveAlert = async (alertId: string) => {
@@ -1100,24 +1279,48 @@ function App() {
     const file = e.target.files?.[0];
     if (!file || !profile) return;
 
+    // Validate file size (max 5MB)
+    if (file.size > 5 * 1024 * 1024) {
+      alert('A imagem é muito grande. O limite é 5MB.');
+      return;
+    }
+
+    // Validate file type
+    if (!file.type.startsWith('image/')) {
+      alert('Por favor, selecione um arquivo de imagem válido.');
+      return;
+    }
+
     try {
       setPhotoLoading(true);
       const storageRef = ref(storage, `profiles/${profile.uid}`);
-      // console.log('Iniciando upload da foto...');
-      await uploadBytes(storageRef, file);
-      // console.log('Upload concluído, obtendo URL...');
-      const photoUrl = await getDownloadURL(storageRef);
-      // console.log('URL obtida:', photoUrl);
       
-      const updatedProfile = { ...profile, photoUrl };
+      // Upload to Firebase Storage
+      await uploadBytes(storageRef, file);
+      
+      // Get download URL
+      const photoUrl = await getDownloadURL(storageRef);
+      
+      // Update user profile in Firestore
       const path = 'users';
-      await setDoc(doc(db, path, profile.uid), updatedProfile);
-      setProfile(updatedProfile);
-      // console.log('Perfil atualizado no Firestore');
+      await updateDoc(doc(db, path, profile.uid), { photoUrl });
+      
+      // Update local state
+      setProfile({ ...profile, photoUrl });
       alert('Foto de perfil atualizada com sucesso!');
     } catch (err) {
       console.error('Erro no upload da foto:', err);
-      alert('Erro ao carregar foto: ' + (err instanceof Error ? err.message : String(err)));
+      let errorMessage = 'Erro ao carregar foto.';
+      
+      if (err instanceof Error) {
+        if (err.message.includes('storage/unauthorized')) {
+          errorMessage = 'Sem permissão para upload. Verifique as regras do Firebase Storage.';
+        } else {
+          errorMessage += ' ' + err.message;
+        }
+      }
+      
+      alert(errorMessage);
     } finally {
       setPhotoLoading(false);
     }
@@ -1129,10 +1332,9 @@ function App() {
     try {
       setPhotoLoading(true);
       const photoUrl = user.photoURL;
-      const updatedProfile = { ...profile, photoUrl };
       const path = 'users';
-      await setDoc(doc(db, path, profile.uid), updatedProfile);
-      setProfile(updatedProfile);
+      await updateDoc(doc(db, path, profile.uid), { photoUrl });
+      setProfile({ ...profile, photoUrl });
       alert('Foto sincronizada com o Google!');
     } catch (err) {
       console.error('Erro ao sincronizar foto:', err);
