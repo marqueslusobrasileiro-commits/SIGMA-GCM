@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
@@ -14,21 +15,54 @@ import type {
 } from "@simplewebauthn/types";
 import jwt from "jsonwebtoken";
 import cookieParser from "cookie-parser";
-import admin from "firebase-admin";
+import { admin, db } from "./server/lib/firebaseAdmin";
+import { registerGeminiRoutes } from "./server/routes/gemini";
+import { registerAdminUserRoutes } from "./server/routes/adminUsers";
+import { registerNotificationRoutes } from "./server/routes/notifications";
+import { registerRegistrationRoutes } from "./server/routes/registration";
+import { registerShiftReportRoutes } from "./server/routes/shiftReports";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Initialize Firebase Admin
-// In this environment, it should pick up the credentials from the environment
-if (!admin.apps.length) {
-  admin.initializeApp();
-}
-const db = admin.firestore();
-
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 const JWT_SECRET = process.env.JWT_SECRET || "sigma-gcm-secret-key";
+
+// CORS (necessário para o APK/Capacitor: origem costuma ser capacitor://localhost)
+app.use((req, res, next) => {
+  const origin = String(req.headers.origin || "");
+  const isApi = req.path.startsWith("/api/");
+  if (!isApi) return next();
+
+  // Em dev, liberamos origens locais e o origin do WebView (capacitor://localhost).
+  // Para produção, vale restringir por allowlist.
+  const allowOrigin =
+    origin.startsWith("http://localhost") ||
+    origin.startsWith("http://127.0.0.1") ||
+    origin.startsWith("capacitor://localhost") ||
+    origin.startsWith("ionic://localhost") ||
+    origin.startsWith("http://192.168.") ||
+    origin.startsWith("http://10.") ||
+    origin.startsWith("http://172.");
+
+  if (allowOrigin && origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  } else {
+    // fallback mais permissivo em dev (evita bloquear requests sem Origin)
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
+
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Authorization,Content-Type");
+  res.setHeader("Access-Control-Max-Age", "86400");
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+  next();
+});
 
 // Helper to get RP_ID and ORIGIN dynamically
 const getWebAuthnConfig = (req: express.Request) => {
@@ -39,11 +73,31 @@ const getWebAuthnConfig = (req: express.Request) => {
   return { rpID, origin };
 };
 
-app.use(express.json());
+// PDFs em base64 podem passar de 100kb; aumentamos o limite com folga.
+app.use(express.json({ limit: "25mb" }));
 app.use(cookieParser());
+
+// Log leve para depurar rotas de relatório (dev).
+app.use((req, _res, next) => {
+  if (req.path.startsWith("/api/shift-reports")) {
+    // eslint-disable-next-line no-console
+    console.log("[http] shift-reports", req.method, req.path, {
+      hasAuth: !!req.headers.authorization,
+      contentLength: req.headers["content-length"],
+    });
+  }
+  next();
+});
 
 // In-memory challenge store (use Redis or Firestore for production)
 const challenges = new Map<string, string>();
+
+// Modular routes
+registerGeminiRoutes(app);
+registerAdminUserRoutes(app);
+registerNotificationRoutes(app);
+registerRegistrationRoutes(app);
+registerShiftReportRoutes(app);
 
 // --- WebAuthn Routes ---
 
@@ -186,7 +240,12 @@ app.post("/api/webauthn/login-verify", async (req, res) => {
       // Reset failed attempts
       await userDoc.ref.update({ failedAttempts: 0 });
 
-      // Create JWT
+      // Create Firebase Custom Token (client will exchange for Firebase session)
+      const firebaseCustomToken = await admin.auth().createCustomToken(String(user.uid), {
+        role: user.role,
+      });
+
+      // (Opcional/legado) JWT próprio do servidor
       const token = jwt.sign({ uid: user.uid, role: user.role }, JWT_SECRET, { expiresIn: "12h" });
 
       // Audit log
@@ -199,7 +258,7 @@ app.post("/api/webauthn/login-verify", async (req, res) => {
         success: true,
       });
 
-      res.json({ verified: true, token, profile: user });
+      res.json({ verified: true, token, firebaseCustomToken, profile: user });
     } else {
       // Track failed attempt
       const attempts = (user.failedAttempts || 0) + 1;
@@ -238,8 +297,13 @@ app.post("/api/audit-login", async (req, res) => {
 // --- Vite Middleware ---
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
+    const hmrPort = process.env.HMR_PORT ? Number(process.env.HMR_PORT) : 24679;
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        // Evita conflito com o padrão (24678) quando já existe outro Vite rodando.
+        hmr: { port: hmrPort, clientPort: hmrPort },
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);
@@ -256,4 +320,7 @@ async function startServer() {
   });
 }
 
-startServer();
+startServer().catch((err) => {
+  console.error("[server] Falha ao iniciar:", err);
+  process.exit(1);
+});
