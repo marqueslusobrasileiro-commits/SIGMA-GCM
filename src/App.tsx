@@ -30,7 +30,7 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { SUPER_ADMIN_EMAIL } from './config';
-import appLogo from '../icons/icon-512.webp';
+import appLogo from './assets/sigma-logo.svg';
 import { 
   startRegistration, 
   startAuthentication 
