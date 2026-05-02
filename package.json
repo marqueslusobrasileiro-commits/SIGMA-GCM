@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
-    "start": "node ./node_modules/tsx/dist/cli.mjs server.ts",
+    "start": "npx tsx server.ts",
     "build": "vite build",
     "build:android": "set CAPACITOR=true&& vite build --mode capacitor",
     "preview": "vite preview",

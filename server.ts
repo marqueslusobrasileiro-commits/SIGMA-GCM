@@ -295,8 +295,17 @@ app.post("/api/audit-login", async (req, res) => {
 });
 
 // --- Vite Middleware ---
+/** Render define RENDER=true; NODE_ENV nem sempre vem como "production". */
+function isProductionRuntime(): boolean {
+  return (
+    process.env.NODE_ENV === "production" ||
+    process.env.RENDER === "true" ||
+    process.env.RENDER_EXTERNAL_URL !== undefined
+  );
+}
+
 async function startServer() {
-  if (process.env.NODE_ENV !== "production") {
+  if (!isProductionRuntime()) {
     const hmrPort = process.env.HMR_PORT ? Number(process.env.HMR_PORT) : 24679;
     const vite = await createViteServer({
       server: {
