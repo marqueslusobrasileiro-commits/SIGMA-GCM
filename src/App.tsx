@@ -941,7 +941,7 @@ function App() {
     const params = new URLSearchParams(window.location.search);
     if (params.get('google_login') === 'error') {
       setError(
-        'Login Google falhou. No Render, defina GOOGLE_OAUTH_CLIENT_SECRET (secret do cliente OAuth Web no Google Cloud). No GCP, em Credenciais, adicione o redirect: …/api/auth/google/callback',
+        'Login Google falhou. Confira no Render: (1) GOOGLE_OAUTH_CLIENT_SECRET — secret do cliente OAuth Web; (2) FIREBASE_SERVICE_ACCOUNT — JSON completo da conta de serviço Firebase (Project settings → Service accounts → Generate new private key), colado como variável de ambiente; (3) no GCP, redirect https://…onrender.com/api/auth/google/callback. Veja Logs do Render para detalhe.',
       );
       window.history.replaceState({}, '', window.location.pathname + window.location.hash);
     }

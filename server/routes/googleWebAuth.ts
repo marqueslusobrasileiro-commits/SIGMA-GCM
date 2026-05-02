@@ -84,6 +84,13 @@ export function registerGoogleWebAuthRoutes(app: express.Express): void {
     const cookieState = req.cookies?.g_oauth_state as string | undefined;
 
     if (!code || !state || !cookieState || state !== cookieState) {
+      // eslint-disable-next-line no-console
+      console.error("[googleWebAuth] falha CSRF/state:", {
+        hasCode: !!code,
+        hasStateParam: !!state,
+        hasCookie: !!cookieState,
+        match: state === cookieState,
+      });
       res.clearCookie("g_oauth_state", { path: "/" });
       res.redirect(`${publicOrigin(req)}/?google_login=error`);
       return;
@@ -144,9 +151,10 @@ export function registerGoogleWebAuthRoutes(app: express.Express): void {
       });
 
       res.redirect(`${origin}/`);
-    } catch (err) {
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
       // eslint-disable-next-line no-console
-      console.error("[googleWebAuth] callback:", err);
+      console.error("[googleWebAuth] callback erro (troca código / Firebase Admin):", msg);
       res.redirect(`${origin}/?google_login=error`);
     }
   });
