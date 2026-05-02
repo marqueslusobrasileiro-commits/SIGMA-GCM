@@ -50,6 +50,9 @@ export function registerGoogleWebAuthRoutes(app: express.Express): void {
     const state = crypto.randomBytes(24).toString("hex");
     const redirectUri = `${origin}/api/auth/google/callback`;
 
+    // eslint-disable-next-line no-console
+    console.log("[googleWebAuth] start", { origin, redirectUri });
+
     res.cookie("g_oauth_state", state, {
       httpOnly: true,
       secure: isSecureRequest(req),
@@ -150,6 +153,14 @@ export function registerGoogleWebAuthRoutes(app: express.Express): void {
         path: "/",
       });
 
+      // eslint-disable-next-line no-console
+      console.log("[googleWebAuth] callback ok (exchange set)", {
+        email,
+        hasExchange: true,
+        secureCookie: isSecureRequest(req),
+        origin,
+      });
+
       res.redirect(`${origin}/`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -165,6 +176,12 @@ export function registerGoogleWebAuthRoutes(app: express.Express): void {
     res.clearCookie("g_exchange", { path: "/" });
 
     if (!exchangeId) {
+      // eslint-disable-next-line no-console
+      console.warn("[googleWebAuth] complete: sem cookie g_exchange", {
+        hasCookieHeader: !!req.headers.cookie,
+        secureReq: isSecureRequest(req),
+        origin: publicOrigin(req),
+      });
       return res.status(204).end();
     }
 
@@ -172,9 +189,13 @@ export function registerGoogleWebAuthRoutes(app: express.Express): void {
     pendingExchanges.delete(exchangeId);
 
     if (!pending || Date.now() > pending.exp) {
+      // eslint-disable-next-line no-console
+      console.warn("[googleWebAuth] complete: exchange expirado/ausente", { exchangeId });
       return res.status(401).json({ error: "expired" });
     }
 
+    // eslint-disable-next-line no-console
+    console.log("[googleWebAuth] complete: token ok", { exchangeId });
     return res.json({ firebaseCustomToken: pending.token });
   });
 }
