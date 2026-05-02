@@ -6,7 +6,7 @@ import {
   AlertTriangle, 
   History, 
   MapPin, 
-  Camera, 
+  Camera as CameraIcon, 
   LogOut, 
   User, 
   Truck, 
@@ -29,6 +29,8 @@ import {
   BookOpen
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { SUPER_ADMIN_EMAIL } from './config';
+import appLogo from '../icons/icon-512.webp';
 import { 
   startRegistration, 
   startAuthentication 
@@ -39,8 +41,13 @@ import {
   signOut,
   User as FirebaseUser,
   GoogleAuthProvider,
-  signInWithPopup
+  getRedirectResult,
+  signInWithCredential,
+  signInWithCustomToken
 } from 'firebase/auth';
+import { Capacitor } from '@capacitor/core';
+import { GoogleSignIn } from '@capawesome/capacitor-google-sign-in';
+import { Camera, CameraResultType, CameraSource } from '@capacitor/camera';
 import { 
   collection, 
   doc, 
@@ -51,16 +58,16 @@ import {
   onSnapshot, 
   query, 
   orderBy, 
+  limit,
+  getDocs,
   where,
   deleteDoc,
   updateDoc,
   Timestamp,
   serverTimestamp
 } from 'firebase/firestore';
-import { Html5Qrcode } from 'html5-qrcode';
-import { jsPDF } from 'jspdf';
-import autoTable from 'jspdf-autotable';
 import { format, isToday, startOfDay, endOfDay } from 'date-fns';
+import { groupByDay } from './lib/groupByDay';
 import { QRCodeSVG, QRCodeCanvas } from 'qrcode.react';
 import * as OpenLocationCode from 'open-location-code';
 import { 
@@ -82,7 +89,12 @@ import {
   getDownloadURL 
 } from 'firebase/storage';
 import { auth, db, storage } from './firebase';
+import { getSecondaryAuth } from './lib/firebaseSecondary';
 import { cn } from './lib/utils';
+import { generateGeminiText } from './lib/gemini';
+import { generateEndOfShiftReportPdf } from './lib/reports/endOfShiftReport';
+import { addSigmaHeader } from './lib/reports/pdfBranding';
+import { getShiftWindow } from './lib/shifts';
 import { 
   UserProfile, 
   PublicProperty, 
@@ -95,12 +107,37 @@ import {
   AuditLog,
   VehicleLocation,
   Geofence,
-  OperationalAlert
+  OperationalAlert,
+  ShiftReport
 } from './types';
-import { AdminPanel } from './components/AdminPanel';
-import { PatrolMap, MapComponent } from './components/PatrolMap';
-import { SystemManual } from './components/SystemManual';
-import { StrategicDashboard } from './components/StrategicDashboard';
+
+const AdminPanel = React.lazy(async () => {
+  const mod = await import('./components/AdminPanel');
+  return { default: mod.AdminPanel };
+});
+
+const isNativeApp = () => {
+  try {
+    return Capacitor.getPlatform() !== 'web';
+  } catch {
+    return false;
+  }
+};
+
+const SystemManual = React.lazy(async () => {
+  const mod = await import('./components/SystemManual');
+  return { default: mod.SystemManual };
+});
+
+const StrategicDashboard = React.lazy(async () => {
+  const mod = await import('./components/StrategicDashboard');
+  return { default: mod.StrategicDashboard };
+});
+
+const MapComponent = React.lazy(async () => {
+  const mod = await import('./components/PatrolMap');
+  return { default: mod.MapComponent };
+});
 
 // --- Firestore Error Handling ---
 enum OperationType {
@@ -249,15 +286,44 @@ const Badge = ({ children, variant = 'info', className }: { children: React.Reac
 
 // --- Components ---
 
-const TeamVehicleSetupModal = ({ teams, vehicles, onSave, loading: parentLoading }: { teams: Team[], vehicles: Vehicle[], onSave: (teamData: Partial<Team>) => void, loading: boolean }) => {
+const TeamVehicleSetupModal = ({
+  teams,
+  vehicles,
+  onSave,
+  loading: parentLoading,
+  canCreateUsers,
+  onCreateUser,
+}: {
+  teams: Team[];
+  vehicles: Vehicle[];
+  onSave: (teamData: Partial<Team>) => Promise<void>;
+  loading: boolean;
+  canCreateUsers: boolean;
+  onCreateUser: (data: {
+    name: string;
+    registration: string;
+    email: string;
+    password: string;
+    role: UserRole;
+  }) => Promise<void>;
+}) => {
   const [selectedVehicleId, setSelectedVehicleId] = useState('');
   const [teamName, setTeamName] = useState('');
-  const [shift, setShift] = useState<'Manhã' | 'Tarde' | 'Noite'>('Manhã');
+  const [shift, setShift] = useState<'Diurno' | 'Intermediário' | 'Noturno'>('Diurno');
   const [driver, setDriver] = useState('');
   const [inCharge, setInCharge] = useState('');
   const [aux1, setAux1] = useState('');
   const [aux2, setAux2] = useState('');
   const [localLoading, setLocalLoading] = useState(false);
+  const [showCreateUser, setShowCreateUser] = useState(false);
+  const [newUserName, setNewUserName] = useState('');
+  const [newUserRegistration, setNewUserRegistration] = useState('');
+  const [newUserEmail, setNewUserEmail] = useState('');
+  const [newUserPassword, setNewUserPassword] = useState('');
+  const [newUserRole, setNewUserRole] = useState<UserRole>('agent');
+
+  const isLoading = parentLoading || localLoading;
+  const canEditAfterVehicle = !!selectedVehicleId && !isLoading;
 
   const handleSave = async () => {
     if (!selectedVehicleId || !teamName || !driver || !inCharge) {
@@ -268,21 +334,27 @@ const TeamVehicleSetupModal = ({ teams, vehicles, onSave, loading: parentLoading
     const vehicle = vehicles.find(v => v.id === selectedVehicleId);
     if (!vehicle) return;
 
-    onSave({
-      name: teamName,
-      shift,
-      vehicleId: selectedVehicleId,
-      vehiclePrefix: vehicle.prefix,
-      driver,
-      inCharge,
-      aux1,
-      aux2,
-      active: true,
-      createdAt: new Date().toISOString()
-    });
+    setLocalLoading(true);
+    try {
+      await onSave({
+        name: teamName,
+        shift,
+        vehicleId: selectedVehicleId,
+        vehiclePrefix: vehicle.prefix || 'N/A',
+        driver,
+        inCharge,
+        aux1,
+        aux2,
+        active: true,
+        createdAt: new Date().toISOString(),
+      });
+    } catch (e) {
+      console.error('[setup] falha ao salvar plantão:', e);
+      alert('Falha ao salvar o plantão. Verifique permissões/rede e tente novamente.');
+    } finally {
+      setLocalLoading(false);
+    }
   };
-
-  const isLoading = parentLoading || localLoading;
 
   return (
     <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[80] flex items-center justify-center p-4 overflow-y-auto">
@@ -322,7 +394,7 @@ const TeamVehicleSetupModal = ({ teams, vehicles, onSave, loading: parentLoading
                 className="w-full bg-gray-50 border border-gray-200 rounded-lg py-2.5 px-4 text-gray-900 outline-none focus:ring-2 focus:ring-blue-900/20"
                 value={teamName}
                 onChange={(e) => setTeamName(e.target.value.toUpperCase())}
-                disabled={isLoading}
+                disabled={!canEditAfterVehicle}
               />
             </div>
             <div className="space-y-1.5">
@@ -331,14 +403,20 @@ const TeamVehicleSetupModal = ({ teams, vehicles, onSave, loading: parentLoading
                 className="w-full bg-gray-50 border border-gray-200 rounded-lg py-2.5 px-4 text-gray-900 outline-none"
                 value={shift}
                 onChange={(e) => setShift(e.target.value as any)}
-                disabled={isLoading}
+                disabled={!canEditAfterVehicle}
               >
-                <option value="Manhã">Manhã</option>
-                <option value="Tarde">Tarde</option>
-                <option value="Noite">Noite</option>
+                <option value="Diurno">Diurno (06:00–18:00)</option>
+                <option value="Intermediário">Intermediário (14:00–02:00)</option>
+                <option value="Noturno">Noturno (18:00–06:00)</option>
               </select>
             </div>
           </div>
+
+          {!selectedVehicleId && (
+            <div className="bg-amber-50 border border-amber-200 text-amber-800 rounded-xl px-4 py-3 text-sm">
+              Selecione uma <b>viatura</b> para liberar o preenchimento da equipe.
+            </div>
+          )}
 
           <div className="space-y-4 pt-2">
             <h4 className="text-xs font-bold text-gray-400 uppercase tracking-widest">Composição da Equipe</h4>
@@ -352,7 +430,7 @@ const TeamVehicleSetupModal = ({ teams, vehicles, onSave, loading: parentLoading
                   className="w-full bg-gray-50 border border-gray-200 rounded-lg py-2.5 px-4 text-gray-900 outline-none focus:ring-2 focus:ring-blue-900/20"
                   value={driver}
                   onChange={(e) => setDriver(e.target.value)}
-                  disabled={isLoading}
+                  disabled={!canEditAfterVehicle}
                 />
               </div>
               <div className="space-y-1.5">
@@ -363,7 +441,7 @@ const TeamVehicleSetupModal = ({ teams, vehicles, onSave, loading: parentLoading
                   className="w-full bg-gray-50 border border-gray-200 rounded-lg py-2.5 px-4 text-gray-900 outline-none focus:ring-2 focus:ring-blue-900/20"
                   value={inCharge}
                   onChange={(e) => setInCharge(e.target.value)}
-                  disabled={isLoading}
+                  disabled={!canEditAfterVehicle}
                 />
               </div>
               <div className="space-y-1.5">
@@ -374,7 +452,7 @@ const TeamVehicleSetupModal = ({ teams, vehicles, onSave, loading: parentLoading
                   className="w-full bg-gray-50 border border-gray-200 rounded-lg py-2.5 px-4 text-gray-900 outline-none focus:ring-2 focus:ring-blue-900/20"
                   value={aux1}
                   onChange={(e) => setAux1(e.target.value)}
-                  disabled={isLoading}
+                  disabled={!canEditAfterVehicle}
                 />
               </div>
               <div className="space-y-1.5">
@@ -385,11 +463,128 @@ const TeamVehicleSetupModal = ({ teams, vehicles, onSave, loading: parentLoading
                   className="w-full bg-gray-50 border border-gray-200 rounded-lg py-2.5 px-4 text-gray-900 outline-none focus:ring-2 focus:ring-blue-900/20"
                   value={aux2}
                   onChange={(e) => setAux2(e.target.value)}
-                  disabled={isLoading}
+                  disabled={!canEditAfterVehicle}
                 />
               </div>
             </div>
           </div>
+
+          {canCreateUsers && (
+            <div className="pt-4 border-t border-gray-100">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <h4 className="text-xs font-bold text-gray-400 uppercase tracking-widest">Admin</h4>
+                  <p className="text-sm text-gray-600 mt-1">Cadastrar novo usuário (sem deslogar)</p>
+                </div>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="border-gray-200"
+                  disabled={isLoading}
+                  onClick={() => setShowCreateUser((v) => !v)}
+                >
+                  {showCreateUser ? 'Fechar' : 'Cadastrar usuário'}
+                </Button>
+              </div>
+
+              {showCreateUser && (
+                <div className="mt-4 space-y-3">
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div className="space-y-1.5">
+                      <label className="text-sm font-medium text-gray-700">Nome *</label>
+                      <input
+                        type="text"
+                        className="w-full bg-gray-50 border border-gray-200 rounded-lg py-2.5 px-4 text-gray-900 outline-none focus:ring-2 focus:ring-blue-900/20"
+                        value={newUserName}
+                        onChange={(e) => setNewUserName(e.target.value)}
+                        disabled={isLoading}
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-sm font-medium text-gray-700">Matrícula *</label>
+                      <input
+                        type="text"
+                        className="w-full bg-gray-50 border border-gray-200 rounded-lg py-2.5 px-4 text-gray-900 outline-none focus:ring-2 focus:ring-blue-900/20"
+                        value={newUserRegistration}
+                        onChange={(e) => setNewUserRegistration(e.target.value)}
+                        disabled={isLoading}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div className="space-y-1.5">
+                      <label className="text-sm font-medium text-gray-700">E-mail *</label>
+                      <input
+                        type="email"
+                        className="w-full bg-gray-50 border border-gray-200 rounded-lg py-2.5 px-4 text-gray-900 outline-none focus:ring-2 focus:ring-blue-900/20"
+                        value={newUserEmail}
+                        onChange={(e) => setNewUserEmail(e.target.value)}
+                        disabled={isLoading}
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <label className="text-sm font-medium text-gray-700">Senha *</label>
+                      <input
+                        type="password"
+                        className="w-full bg-gray-50 border border-gray-200 rounded-lg py-2.5 px-4 text-gray-900 outline-none focus:ring-2 focus:ring-blue-900/20"
+                        value={newUserPassword}
+                        onChange={(e) => setNewUserPassword(e.target.value)}
+                        disabled={isLoading}
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="text-sm font-medium text-gray-700">Perfil *</label>
+                    <select
+                      className="w-full bg-gray-50 border border-gray-200 rounded-lg py-2.5 px-4 text-gray-900 outline-none"
+                      value={newUserRole}
+                      onChange={(e) => setNewUserRole(e.target.value as UserRole)}
+                      disabled={isLoading}
+                    >
+                      <option value="agent">Agente Operacional</option>
+                      <option value="supervisor">Supervisor de Dia</option>
+                      <option value="admin">Administrador</option>
+                    </select>
+                  </div>
+
+                  <Button
+                    type="button"
+                    className="w-full"
+                    disabled={isLoading}
+                    onClick={async () => {
+                      if (!newUserName || !newUserRegistration || !newUserEmail || !newUserPassword) {
+                        alert('Preencha todos os campos do novo usuário.');
+                        return;
+                      }
+                      setLocalLoading(true);
+                      try {
+                        await onCreateUser({
+                          name: newUserName,
+                          registration: newUserRegistration,
+                          email: newUserEmail,
+                          password: newUserPassword,
+                          role: newUserRole,
+                        });
+                        setNewUserName('');
+                        setNewUserRegistration('');
+                        setNewUserEmail('');
+                        setNewUserPassword('');
+                        setNewUserRole('agent');
+                        alert('Usuário cadastrado com sucesso!');
+                      } finally {
+                        setLocalLoading(false);
+                      }
+                    }}
+                  >
+                    Criar usuário
+                  </Button>
+                </div>
+              )}
+            </div>
+          )}
 
           <div className="pt-4">
             <Button 
@@ -413,6 +608,7 @@ function App() {
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
   const [photoLoading, setPhotoLoading] = useState(false);
+  const [photoLoadingStep, setPhotoLoadingStep] = useState<string | null>(null);
   const [showAdminPanel, setShowAdminPanel] = useState(false);
   const [activeTab, setActiveTab] = useState<'home' | 'history' | 'dashboard' | 'properties' | 'teams' | 'vehicles' | 'map' | 'manual'>('home');
   const [historyTab, setHistoryTab] = useState<'patrols' | 'occurrences'>('patrols');
@@ -430,6 +626,7 @@ function App() {
   const [submittingOccurrence, setSubmittingOccurrence] = useState(false);
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [showTeamVehicleSetup, setShowTeamVehicleSetup] = useState(false);
+  const [setupTeamVehicleSaving, setSetupTeamVehicleSaving] = useState(false);
   const [isEditingProfile, setIsEditingProfile] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [propertySearch, setPropertySearch] = useState('');
@@ -461,6 +658,33 @@ function App() {
   const [alerts, setAlerts] = useState<OperationalAlert[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [lastLoginTime, setLastLoginTime] = useState<number>(0);
+  const [pendingUsersCount, setPendingUsersCount] = useState<number>(0);
+  const hasShownPendingAlertRef = useRef(false);
+  const isMasterAdmin =
+    !!profile &&
+    profile.role === 'admin' &&
+    (profile.email || '').toLowerCase() === SUPER_ADMIN_EMAIL.toLowerCase();
+
+  const [isHeaderCollapsed, setIsHeaderCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('ui:headerCollapsed') === '1';
+    } catch {
+      return false;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('ui:headerCollapsed', isHeaderCollapsed ? '1' : '0');
+    } catch {}
+  }, [isHeaderCollapsed]);
+
+  // Relatório obrigatório ao fim do plantão
+  const [recentShiftReports, setRecentShiftReports] = useState<ShiftReport[]>([]);
+  const [forceShiftReportModal, setForceShiftReportModal] = useState(false);
+  const [forceShiftReportWindow, setForceShiftReportWindow] = useState<{ start: Date; end: Date; label: string } | null>(null);
+  const [forceShiftReportLoading, setForceShiftReportLoading] = useState(false);
+  const [pendingLogoutAfterReport, setPendingLogoutAfterReport] = useState(false);
 
   // Check for 12-hour re-auth
   useEffect(() => {
@@ -473,6 +697,77 @@ function App() {
       }
     }
   }, [user, lastLoginTime]);
+
+  // Assina relatórios recentes do agente (para validar se já enviou o plantão)
+  useEffect(() => {
+    // Regra: qualquer usuário operacional com teamId precisa enviar relatório do turno.
+    // (Admin/visitante não entram nessa obrigatoriedade.)
+    if (!profile || !profile.teamId) return;
+    if (profile.role === 'admin') return;
+    const q = query(
+      collection(db, 'shift_reports'),
+      where('agentId', '==', profile.uid),
+      orderBy('createdAt', 'desc'),
+      limit(50),
+    );
+    const unsub = onSnapshot(
+      q,
+      (snap) => {
+        setRecentShiftReports(
+          snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<ShiftReport, 'id'>) })),
+        );
+      },
+      (err) => {
+        console.warn('[shift_reports] falha ao ler relatórios recentes:', err);
+        setRecentShiftReports([]);
+      },
+    );
+    return () => unsub();
+  }, [profile?.uid, profile?.role, profile?.teamId]);
+
+  // Verifica continuamente se o relatório do plantão foi enviado (obrigatório)
+  useEffect(() => {
+    if (!profile || !profile.teamId || profile.role === 'admin') {
+      setForceShiftReportModal(false);
+      setForceShiftReportWindow(null);
+      return;
+    }
+
+    const graceMs = 10 * 60 * 1000; // 10 minutos após o fim do turno
+
+    const hasReportForWindow = (windowStartIso: string) => {
+      return recentShiftReports.some(
+        (r) => r.teamId === profile.teamId && r.windowStart === windowStartIso,
+      );
+    };
+
+    const computeMustSend = () => {
+      const team = teams.find((t) => t.id === profile.teamId);
+      if (!team) return { mustSend: false, window: null as any };
+      const now = new Date();
+      const window = getShiftWindow(now, team.shift);
+      const startIso = window.start.toISOString();
+      const mustSend = now.getTime() > window.end.getTime() + graceMs && !hasReportForWindow(startIso);
+      return { mustSend, window, startIso };
+    };
+
+    const tick = () => {
+      const { mustSend, window } = computeMustSend();
+      if (!window) return;
+
+      if (mustSend) {
+        setForceShiftReportWindow({ start: window.start, end: window.end, label: window.label });
+        setForceShiftReportModal(true);
+      } else {
+        setForceShiftReportModal(false);
+        setForceShiftReportWindow(null);
+      }
+    };
+
+    tick();
+    const id = window.setInterval(tick, 60 * 1000);
+    return () => window.clearInterval(id);
+  }, [profile?.uid, profile?.role, profile?.teamId, teams, recentShiftReports]);
 
   // Auth Listener
   useEffect(() => {
@@ -488,8 +783,9 @@ function App() {
           if (docSnap.exists()) {
             const profileData = docSnap.data() as UserProfile;
             
-            // AUTO-ADMIN for primary user
-            if (u.email === 'marquesluso.brasileiro@gmail.com' && (profileData.role !== 'admin' || profileData.status !== 'ATIVO')) {
+            // AUTO-ADMIN for primary users
+            const isAdminEmail = u.email === SUPER_ADMIN_EMAIL;
+            if (isAdminEmail && (profileData.role !== 'admin' || profileData.status !== 'ATIVO')) {
               const updatedProfile = { ...profileData, role: 'admin' as UserRole, status: 'ATIVO' as UserStatus };
               await updateDoc(docRef, updatedProfile);
               setProfile(updatedProfile);
@@ -497,15 +793,121 @@ function App() {
               setProfile(profileData);
             }
             
-            if (profileData.status === 'ATIVO') {
-              if (profileData.role === 'agent' && (!profileData.teamId || !profileData.vehicleId)) {
-                setShowTeamVehicleSetup(true);
+            // Bloqueia acesso ao app enquanto estiver PENDENTE/BLOQUEADO.
+            // Isso impede que qualquer pessoa recém-cadastrada use o sistema antes de aprovação.
+            if (profileData.status !== 'ATIVO') {
+              // Garante no backend (Admin SDK) que o perfil PENDENTE existe no Firestore e notifica admin.
+              // Esse caminho cobre casos em que o usuário já existia no Auth ou o write client-side falhou.
+              try {
+                const idToken = await u.getIdToken();
+                await fetch('/api/registration/request', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${idToken}`,
+                  },
+                  body: JSON.stringify({
+                    name: profileData.name || '',
+                    registration: profileData.registration || '',
+                    email: u.email || '',
+                  }),
+                });
+                await fetch('/api/notifications/pending-user', {
+                  method: 'POST',
+                  headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${idToken}`,
+                  },
+                });
+              } catch (e) {
+                console.warn('Falha ao garantir solicitação no backend (perfil não ATIVO):', e);
               }
+              setProfile(null);
+              setError('Seu cadastro ainda não foi autorizado pelo administrador. Aguarde a liberação para acessar.');
+              try {
+                await signOut(auth);
+              } catch {}
+              setLoading(false);
+              return;
+            }
+
+            // Mantém o modal sincronizado com o estado real do perfil (evita "loop" de reabrir).
+            setShowTeamVehicleSetup(
+              profileData.role === 'agent' && (!profileData.teamId || !profileData.vehicleId),
+            );
+          } else {
+            // Usuário autenticado, mas perfil ainda não existe.
+            // Cria automaticamente um perfil PENDENTE para o admin aprovar e desloga.
+            try {
+              const isAdminEmail = u.email === SUPER_ADMIN_EMAIL;
+              // Super-admin: não desloga aqui. Deixa o app mostrar a tela "Concluir Cadastro"
+              // para criar o próprio perfil `admin` no Firestore.
+              if (isAdminEmail) {
+                setProfile(null);
+                setError(null);
+                setLoading(false);
+                return;
+              }
+              if (!isAdminEmail) {
+                const fallbackName =
+                  u.displayName ||
+                  (u.email ? u.email.split('@')[0] : 'Usuário');
+
+                const pendingProfile: UserProfile = {
+                  uid: u.uid,
+                  name: fallbackName,
+                  registration: '',
+                  role: 'agent',
+                  status: 'PENDENTE',
+                  email: u.email || '',
+                  createdAt: new Date().toISOString(),
+                };
+
+                await setDoc(docRef, pendingProfile, { merge: true });
+                // Também garante via backend (Admin SDK) para não depender de rules/cache.
+                // Notificação interna (backend) para admin aprovar o cadastro.
+                // Best-effort: se falhar, não bloqueia o fluxo.
+                try {
+                  const idToken = await u.getIdToken();
+                  await fetch('/api/registration/request', {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      Authorization: `Bearer ${idToken}`,
+                    },
+                    body: JSON.stringify({
+                      name: pendingProfile.name || '',
+                      registration: pendingProfile.registration || '',
+                      email: pendingProfile.email || '',
+                    }),
+                  });
+                  await fetch('/api/notifications/pending-user', {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      Authorization: `Bearer ${idToken}`,
+                    },
+                  });
+                } catch (notifyErr) {
+                  console.warn('Falha ao notificar admin sobre cadastro pendente (auto):', notifyErr);
+                }
+                setError('Seu cadastro ainda não foi autorizado pelo administrador. Aguarde a liberação para acessar.');
+              }
+            } catch (createErr) {
+              console.error('Falha ao criar perfil PENDENTE automaticamente:', createErr);
+              setError('Não foi possível registrar sua solicitação de acesso (regras/permissão do Firestore). Contate o administrador.');
+            } finally {
+              setProfile(null);
+              try {
+                await signOut(auth);
+              } catch {}
             }
           }
           setLoading(false);
         }, (err) => {
           console.error("Profile listener error:", err);
+          setProfile(null);
+          setError('Não foi possível carregar seu perfil (permissão/rede). Tente novamente ou contate o administrador.');
           setLoading(false);
         });
       } else {
@@ -521,20 +923,76 @@ function App() {
     };
   }, []);
 
+  // Inicializa Google Sign-In nativo no Android (Capacitor)
+  useEffect(() => {
+    if (!Capacitor.isNativePlatform()) return;
+    void GoogleSignIn.initialize({
+      // Web client id (Firebase Auth -> Google provider -> Web SDK config)
+      clientId: '343507031983-64oi12lm43bvgj1cu7lb7jca9uvnisgd.apps.googleusercontent.com',
+    }).catch((err) => {
+      console.error('GoogleSignIn.initialize error:', err);
+    });
+  }, []);
+
+  // Web: login Google via servidor (/api/auth/google → custom token) contorna auth/unauthorized-domain no SDK.
+  // Mantém getRedirectResult só para sessões antigas que ainda usavam signInWithRedirect.
+  useEffect(() => {
+    if (Capacitor.isNativePlatform()) return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('google_login') === 'error') {
+      setError(
+        'Login Google falhou. No Render, defina GOOGLE_OAUTH_CLIENT_SECRET (secret do cliente OAuth Web no Google Cloud). No GCP, em Credenciais, adicione o redirect: …/api/auth/google/callback',
+      );
+      window.history.replaceState({}, '', window.location.pathname + window.location.hash);
+    }
+    void (async () => {
+      try {
+        const completeRes = await fetch('/api/auth/google/complete', { credentials: 'include' });
+        if (completeRes.ok && completeRes.status !== 204) {
+          const data = await completeRes.json();
+          if (data?.firebaseCustomToken) {
+            await signInWithCustomToken(auth, data.firebaseCustomToken);
+            setError(null);
+            return;
+          }
+        }
+      } catch (e) {
+        console.warn('google web auth complete:', e);
+      }
+      // Na web o login Google é só via servidor; getRedirectResult do SDK costuma dar auth/unauthorized-domain se restou estado antigo.
+      if (Capacitor.getPlatform() === 'web') return;
+      try {
+        const result = await getRedirectResult(auth);
+        if (result?.user) setError(null);
+      } catch (err: unknown) {
+        console.warn('getRedirectResult error:', err);
+      }
+    })();
+  }, []);
+
   // Real-time Data Listeners
   useEffect(() => {
-    if (!user) return;
+    if (!user || !profile || profile.status !== 'ATIVO') return;
 
-    const qPatrols = query(collection(db, 'patrols'), orderBy('timestamp', 'desc'));
+    // Para agente, mostra apenas rondas do próprio usuário (evita “misturar” rondas do admin).
+    // Importante: `where(agentId==X) + orderBy(timestamp)` exige índice composto no Firestore.
+    // Para não depender de índice, ordenamos no cliente.
+    const qPatrols =
+      profile?.role === 'agent'
+        ? query(collection(db, 'patrols'), where('agentId', '==', profile.uid), limit(200))
+        : query(collection(db, 'patrols'), orderBy('timestamp', 'desc'));
     const unsubPatrols = onSnapshot(qPatrols, (snap) => {
-      setPatrols(snap.docs.map(d => {
+      const items = snap.docs.map(d => {
         const data = d.data();
-        return { 
-          id: d.id, 
+        return {
+          id: d.id,
           ...data,
-          timestamp: data.timestamp instanceof Timestamp ? data.timestamp.toDate().toISOString() : data.timestamp 
+          timestamp: data.timestamp instanceof Timestamp ? data.timestamp.toDate().toISOString() : data.timestamp,
         } as PatrolRecord;
-      }));
+      });
+      // Mantém a ordenação mais recente primeiro mesmo sem orderBy no servidor.
+      items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+      setPatrols(items);
     }, (err) => {
       handleFirestoreError(err, OperationType.GET, 'patrols');
     });
@@ -546,16 +1004,21 @@ function App() {
       handleFirestoreError(err, OperationType.GET, 'properties');
     });
 
-    const qOccurrences = query(collection(db, 'occurrences'), orderBy('timestamp', 'desc'));
+    const qOccurrences =
+      profile?.role === 'agent'
+        ? query(collection(db, 'occurrences'), where('agentId', '==', profile.uid), limit(200))
+        : query(collection(db, 'occurrences'), orderBy('timestamp', 'desc'));
     const unsubOccurrences = onSnapshot(qOccurrences, (snap) => {
-      setOccurrences(snap.docs.map(d => {
+      const items = snap.docs.map(d => {
         const data = d.data();
-        return { 
-          id: d.id, 
+        return {
+          id: d.id,
           ...data,
-          timestamp: data.timestamp instanceof Timestamp ? data.timestamp.toDate().toISOString() : data.timestamp 
+          timestamp: data.timestamp instanceof Timestamp ? data.timestamp.toDate().toISOString() : data.timestamp,
         } as OccurrenceRecord;
-      }));
+      });
+      items.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+      setOccurrences(items);
     }, (err) => {
       handleFirestoreError(err, OperationType.GET, 'occurrences');
     });
@@ -602,7 +1065,7 @@ function App() {
       unsubGeofences();
       unsubAlerts();
     };
-  }, [user]);
+  }, [user, profile]);
 
   // Real-time GPS Tracking for Agents
   useEffect(() => {
@@ -619,7 +1082,7 @@ function App() {
         const locationData: VehicleLocation = {
           id: profile.vehicleId!,
           vehicleId: profile.vehicleId!,
-          vehiclePrefix: team.vehiclePrefix,
+          vehiclePrefix: team.vehiclePrefix || 'N/A',
           teamId: team.id,
           teamName: team.name,
           driver: team.driver,
@@ -733,241 +1196,98 @@ function App() {
     }
 
     try {
-      const pdfDoc = new jsPDF();
-      const today = new Date();
-      
-      const todayPatrols = patrols.filter(p => {
-        try {
-          return isToday(new Date(p.timestamp)) && p.teamId === profile?.teamId;
-        } catch (e) {
-          return false;
-        }
-      }).sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-
-      const todayOccurrences = occurrences.filter(o => {
-        try {
-          return isToday(new Date(o.timestamp));
-        } catch (e) {
-          return false;
-        }
-      }).sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-
-      // Fetch the latest team data directly from Firestore to ensure it's up to date
-      let team: Team | undefined = undefined;
-      if (profile?.teamId) {
-        try {
-          // Force fetch from server to avoid cached stale data
-          const teamDoc = await getDocFromServer(doc(db, 'teams', profile.teamId));
-          if (teamDoc.exists()) {
-            team = { id: teamDoc.id, ...teamDoc.data() } as Team;
-          }
-        } catch (e) {
-          console.error("Error fetching latest team data for report:", e);
-          // Fallback to local state if fetch fails
-          team = teams.find(t => t.id === profile.teamId);
-        }
-      }
-
-      // Function to load image and convert to base64 for jsPDF
-      const loadImage = (url: string): Promise<string> => {
-        return new Promise((resolve, reject) => {
-          const img = new Image();
-          img.crossOrigin = 'Anonymous';
-          img.onload = () => {
-            const canvas = document.createElement('canvas');
-            canvas.width = img.width;
-            canvas.height = img.height;
-            const ctx = canvas.getContext('2d');
-            if (ctx) {
-              ctx.drawImage(img, 0, 0);
-              resolve(canvas.toDataURL('image/jpeg', 0.7));
-            } else {
-              reject(new Error('Could not get canvas context'));
-            }
-          };
-          img.onerror = (e) => reject(e);
-          img.src = url;
-        });
-      };
-
-      // Header
-      pdfDoc.setFillColor(15, 44, 99);
-      pdfDoc.rect(0, 0, 210, 45, 'F');
-      
-      // Logo Placeholder
-      pdfDoc.setDrawColor(255, 255, 255);
-      pdfDoc.setLineWidth(0.5);
-      if (profile?.photoUrl) {
-        try {
-          const profileImg = await loadImage(profile.photoUrl);
-          pdfDoc.addImage(profileImg, 'JPEG', 20, 10, 25, 25);
-          pdfDoc.circle(32.5, 22.5, 12.5, 'S');
-        } catch (e) {
-          pdfDoc.circle(30, 22, 12, 'S');
-          pdfDoc.setFontSize(8);
-          pdfDoc.setTextColor(255, 255, 255);
-          pdfDoc.text('GCM', 30, 24, { align: 'center' });
-        }
-      } else {
-        pdfDoc.circle(30, 22, 12, 'S');
-        pdfDoc.setFontSize(8);
-        pdfDoc.setTextColor(255, 255, 255);
-        pdfDoc.text('GCM', 30, 24, { align: 'center' });
-      }
-
-      pdfDoc.setTextColor(255, 255, 255);
-      pdfDoc.setFontSize(24);
-      pdfDoc.setFont('helvetica', 'bold');
-      pdfDoc.text('SIGMA-GCM', 105, 15, { align: 'center' });
-      
-      pdfDoc.setFontSize(9);
-      pdfDoc.setFont('helvetica', 'italic');
-      pdfDoc.text('Sistema Inteligente de Gestão e Monitoramento Avançado da Guarda Civil Municipal', 105, 21, { align: 'center' });
-      
-      pdfDoc.setFontSize(14);
-      pdfDoc.setFont('helvetica', 'normal');
-      pdfDoc.text('Relatório Operacional de Plantão', 105, 31, { align: 'center' });
-      
-      pdfDoc.setFontSize(9);
-      pdfDoc.text(`Gerado em: ${format(new Date(), 'dd/MM/yyyy HH:mm')}`, 105, 40, { align: 'center' });
-
-      // Info Section
-      pdfDoc.setTextColor(0, 0, 0);
-      pdfDoc.setFontSize(11);
-      pdfDoc.setFont('helvetica', 'bold');
-      pdfDoc.text('DADOS DO PLANTÃO', 20, 55);
-      pdfDoc.line(20, 57, 190, 57);
-
-      pdfDoc.setFontSize(10);
-      pdfDoc.setFont('helvetica', 'normal');
-      pdfDoc.text(`Agente Responsável: ${profile?.name || 'N/A'}`, 20, 65);
-      pdfDoc.text(`Matrícula: ${profile?.registration || 'N/A'}`, 20, 72);
-      pdfDoc.text(`Data do Plantão: ${format(today, 'dd/MM/yyyy')}`, 20, 79);
-
-      pdfDoc.text(`Viatura: ${team?.vehiclePrefix || 'N/A'}`, 110, 65);
-      pdfDoc.text(`Equipe: ${team?.name || 'N/A'}`, 110, 72);
-      pdfDoc.text(`Turno: ${team?.shift || 'N/A'}`, 110, 79);
-
-      // Composition Section
-      pdfDoc.setFont('helvetica', 'bold');
-      pdfDoc.text('COMPOSIÇÃO DA EQUIPE', 20, 92);
-      pdfDoc.line(20, 94, 190, 94);
-
-      pdfDoc.setFont('helvetica', 'normal');
-      pdfDoc.text(`Condutor: ${team?.driver || 'N/A'}`, 20, 102);
-      pdfDoc.text(`Encarregado: ${team?.inCharge || 'N/A'}`, 20, 109);
-      pdfDoc.text(`Auxiliar 01: ${team?.aux1 || '-'}`, 110, 102);
-      pdfDoc.text(`Auxiliar 02: ${team?.aux2 || '-'}`, 110, 109);
-
-      if (team?.members && team.members.length > 0) {
-        pdfDoc.text(`Membros Adicionais: ${team.members.join(', ')}`, 20, 116);
-      }
-
-      // Patrols Table
-      pdfDoc.setFont('helvetica', 'bold');
-      pdfDoc.text('HISTÓRICO DE RONDAS', 20, 125);
-      
-      const patrolTableData = todayPatrols.map(p => [
-        format(new Date(p.timestamp), 'HH:mm'),
-        p.propertyName,
-        p.plusCode || '-',
-        p.status?.toUpperCase() || 'NORMAL',
-        p.observation || '-'
-      ]);
-
-      autoTable(pdfDoc, {
-        startY: 130,
-        head: [['Horário', 'Local / Próprio Público', 'Plus Code', 'Status', 'Observações']],
-        body: patrolTableData,
-        headStyles: { fillColor: [0, 33, 71] },
-        styles: { fontSize: 8 },
-        margin: { left: 20, right: 20 }
+      const { filename, blob, windowStart, windowEnd, shift } = await generateEndOfShiftReportPdf({
+        profile,
+        patrols,
+        occurrences,
+        teams,
+        db,
+        generateGeminiText,
       });
 
-      // Summary
-      let finalY = (pdfDoc as any).lastAutoTable.finalY + 15;
-      pdfDoc.setFont('helvetica', 'bold');
-      pdfDoc.text(`Total de locais visitados: ${todayPatrols.length}`, 20, finalY);
+      // Evita duplicar o mesmo relatório do mesmo plantão sem precisar "ler" a coleção (rules do agente).
+      // Usamos um ID determinístico: agentId_teamId_windowStart(yyyyMMddTHHmm)
+      const reportId =
+        profile.role === 'agent' && profile.teamId
+          ? `${profile.uid}_${profile.teamId}_${windowStart.replace(/[:.]/g, '-')}`
+          : undefined;
 
-      // Occurrences Section
-      finalY += 15;
-      
-      if (todayOccurrences.length > 0) {
-        if (finalY > 250) {
-          pdfDoc.addPage();
-          finalY = 20;
-        }
-        
-        pdfDoc.setFont('helvetica', 'bold');
-        pdfDoc.text('OCORRÊNCIAS REGISTRADAS', 20, finalY);
-        
-        const occurrenceTableData = todayOccurrences.map(o => [
-          format(new Date(o.timestamp), 'HH:mm'),
-          o.propertyName || 'N/A',
-          o.type,
-          o.description
-        ]);
-
-        autoTable(pdfDoc, {
-          startY: finalY + 5,
-          head: [['Horário', 'Local / Posto', 'Tipo de Ocorrência', 'Descrição / Relato']],
-          body: occurrenceTableData,
-          headStyles: { fillColor: [153, 0, 0] }, // Dark red
-          styles: { fontSize: 9 },
-          margin: { left: 20, right: 20 }
-        });
-        
-        finalY = (pdfDoc as any).lastAutoTable.finalY + 15;
-
-        // Add Photos if any
-        const occurrencesWithPhotos = todayOccurrences.filter(o => o.photoUrl);
-        if (occurrencesWithPhotos.length > 0) {
-          if (finalY > 200) {
-            pdfDoc.addPage();
-            finalY = 20;
-          }
-          pdfDoc.setFont('helvetica', 'bold');
-          pdfDoc.text('ANEXOS FOTOGRÁFICOS (OCORRÊNCIAS)', 20, finalY);
-          finalY += 10;
-
-          for (const occ of occurrencesWithPhotos) {
-            if (finalY > 230) {
-              pdfDoc.addPage();
-              finalY = 20;
-            }
-            pdfDoc.setFont('helvetica', 'normal');
-            pdfDoc.setFontSize(8);
-            pdfDoc.text(`${format(new Date(occ.timestamp), 'HH:mm')} - ${occ.type} (${occ.propertyName || 'N/A'})`, 20, finalY);
-            finalY += 5;
+      const sendToServerAndRegister = async () => {
+        if (!user) throw new Error('Sessão expirada.');
+        const idToken = await user.getIdToken();
+        const base64 = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => {
             try {
-              const imgData = await loadImage(occ.photoUrl!);
-              pdfDoc.addImage(imgData, 'JPEG', 20, finalY, 60, 45);
-              finalY += 55;
+              const result = String(reader.result || '');
+              const comma = result.indexOf(',');
+              resolve(comma >= 0 ? result.slice(comma + 1) : result);
             } catch (e) {
-              console.error('Error adding image to PDF:', e);
-              pdfDoc.text('[Erro ao carregar imagem]', 20, finalY);
-              finalY += 10;
+              reject(e);
             }
-          }
+          };
+          reader.onerror = () => reject(reader.error);
+          reader.readAsDataURL(blob);
+        });
+
+        const team = teams.find((t) => t.id === profile.teamId);
+        const resp = await fetch('/api/shift-reports/upload', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`,
+          },
+          body: JSON.stringify({
+            filename,
+            pdfBase64: base64,
+            meta: {
+              agentId: profile.uid,
+              agentName: profile.name,
+              registration: profile.registration,
+              teamId: profile.teamId,
+              teamName: team?.name || '',
+              vehiclePrefix: team?.vehiclePrefix || '',
+              shift,
+              windowStart,
+              windowEnd,
+              reportId,
+            },
+          }),
+        });
+        if (!resp.ok) {
+          const data = await resp.json().catch(() => ({}));
+          throw new Error(data?.error || `Falha ao enviar para o servidor (HTTP ${resp.status})`);
         }
-      } else {
-        finalY += 10;
-        pdfDoc.setFont('helvetica', 'italic');
-        pdfDoc.text('Nenhuma ocorrência registrada neste plantão.', 20, finalY);
-        finalY += 20;
+        const data = (await resp.json().catch(() => ({}))) as { downloadUrl?: string; reportId?: string };
+        // O servidor já registra em `shift_reports` com `localPath`.
+        // Evita escrever pelo cliente para não sobrescrever campos do servidor (ex.: `localPath`).
+        void data;
+      };
+
+      // Envio obrigatório ao Painel ADM (não depende do Firebase Storage).
+      try {
+        await sendToServerAndRegister();
+        alert('Relatório gerado e enviado automaticamente ao Painel do ADM!');
+      } catch (sendErr) {
+        console.error('Falha ao enviar relatório para o Painel do ADM:', sendErr);
+        const msg =
+          sendErr instanceof Error
+            ? sendErr.message
+            : typeof sendErr === 'string'
+              ? sendErr
+              : JSON.stringify(sendErr);
+        alert(
+          'Relatório PDF foi gerado, mas falhou ao ENVIAR automaticamente para o ADM.\n\n' +
+            'Verifique se o servidor está rodando e se o usuário está autenticado.\n\n' +
+            `Detalhes: ${msg}`,
+        );
+        throw sendErr;
       }
-
-      pdfDoc.line(60, finalY + 10, 150, finalY + 10);
-      pdfDoc.setFont('helvetica', 'normal');
-      pdfDoc.setFontSize(10);
-      pdfDoc.text('Assinatura do Agente Responsável', 105, finalY + 18, { align: 'center' });
-      pdfDoc.text(`${profile?.name} - GCM`, 105, finalY + 25, { align: 'center' });
-
-      pdfDoc.save(`Relatorio_Plantao_${profile?.registration || 'GCM'}_${format(today, 'yyyyMMdd')}.pdf`);
-      alert('Relatório gerado com sucesso!');
     } catch (err) {
       console.error('Erro ao gerar relatório:', err);
-      alert('Erro ao gerar relatório PDF.');
+      const msg =
+        err instanceof Error ? err.message : typeof err === 'string' ? err : JSON.stringify(err);
+      alert(`Erro ao gerar/enviar relatório.\n\nDetalhes: ${msg}`);
     }
   };
 
@@ -1018,31 +1338,35 @@ function App() {
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     const formData = new FormData(e.target as HTMLFormElement);
-    const email = formData.get('email') as string;
-    const password = formData.get('password') as string;
-    const vehicle = formData.get('vehicle') as string;
+    const emailRaw = (formData.get('email') as string) || '';
+    const email = emailRaw.trim().toLowerCase();
+    const password = ((formData.get('password') as string) || '').toString();
 
-    if (!vehicle && !isRegistering) {
-      setError('Identificação da viatura é obrigatória');
-      return;
-    }
+    // Identificação da viatura foi movida para pós-login (configuração de equipe/plantão)
 
     try {
       setLoading(true);
       if (isRegistering) {
         const name = formData.get('name') as string;
         const registration = formData.get('registration') as string;
-        const role = formData.get('role') as UserRole;
+        // IMPORTANTE: cadastro nunca define admin/supervisor por conta própria.
+        // O perfil/ativação é responsabilidade do administrador no Firestore.
         
         const { createUserWithEmailAndPassword } = await import('firebase/auth');
         const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+        if (process.env.NODE_ENV !== 'production') {
+          console.log('[register] user criado:', userCredential.user.uid, email);
+        }
+        // Requisito: sempre logar UID criado
+        console.log("UID criado:", userCredential.user.uid);
         
+        const isAdminEmail = email === SUPER_ADMIN_EMAIL.trim().toLowerCase();
         const profileData: UserProfile = {
           uid: userCredential.user.uid,
           name,
           registration,
-          role: email === 'marquesluso.brasileiro@gmail.com' ? 'admin' : role,
-          status: email === 'marquesluso.brasileiro@gmail.com' ? 'ATIVO' : 'PENDENTE',
+          role: isAdminEmail ? 'admin' : 'agent',
+          status: isAdminEmail ? 'ATIVO' : 'PENDENTE',
           email,
           biometricEnabled: false,
           failedAttempts: 0,
@@ -1051,8 +1375,79 @@ function App() {
         
         try {
           const path = 'users';
-          await setDoc(doc(db, path, userCredential.user.uid), profileData);
-          setProfile(profileData);
+          const docRef = doc(db, path, userCredential.user.uid);
+          // Sempre salvar no Firestore imediatamente após o Auth.
+          // IMPORTANTE: não sobrescrever o schema do app (role/status/createdAt),
+          // senão o painel e o RBAC podem parar de funcionar.
+          await setDoc(
+            docRef,
+            {
+              ...profileData,
+              // Campos extras (compat/debug) sem quebrar o schema principal
+              nome: name,
+              matricula: registration || '',
+              roleLabel: 'AGENTE',
+              statusLabel: 'PENDENTE',
+              createdAtServer: serverTimestamp(),
+            },
+            { merge: true },
+          );
+          if (process.env.NODE_ENV !== 'production') {
+            console.log('[register] perfil salvo (Firestore):', profileData.uid, profileData.status);
+          }
+          console.log("Usuário salvo no Firestore");
+
+          // Verificação forte: garante que o documento realmente foi persistido no Firestore.
+          // Ajuda a detectar rules/permissão/offline antes de "sumir" do painel admin.
+          const verifySnap = await getDocFromServer(docRef).catch(() => getDoc(docRef));
+          if (!verifySnap.exists()) {
+            throw new Error('Perfil não persistido no Firestore (doc ausente).');
+          }
+          const saved = verifySnap.data() as any;
+          if (saved?.status !== profileData.status) {
+            throw new Error(`Perfil inconsistente no Firestore (status=${saved?.status}).`);
+          }
+          if (process.env.NODE_ENV !== 'production') {
+            console.log('[register] Usuário salvo no Firestore:', profileData.uid, saved?.status);
+          }
+          // Se não for admin, não deixa "entrar" no app agora.
+          // O usuário só acessa após o administrador alterar status para ATIVO.
+          if (!isAdminEmail) {
+            // Garante no backend (Admin SDK) que o perfil PENDENTE foi persistido e notifica o admin.
+            // Isso evita depender de rules/cache e garante que apareça no painel do administrador.
+            try {
+              const idToken = await userCredential.user.getIdToken();
+              await fetch('/api/registration/request', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${idToken}`,
+                },
+                body: JSON.stringify({
+                  name,
+                  registration,
+                  email,
+                }),
+              });
+              await fetch('/api/notifications/pending-user', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${idToken}`,
+                },
+              });
+            } catch (notifyErr) {
+              console.warn('Falha ao notificar admin sobre cadastro pendente:', notifyErr);
+            }
+
+            setError('Cadastro realizado! Aguarde a autorização do administrador para acessar o sistema.');
+            try {
+              await signOut(auth);
+            } catch {}
+            return;
+          } else {
+            setProfile(profileData);
+          }
           
           // Audit log
           await fetch('/api/audit-login', {
@@ -1067,6 +1462,11 @@ function App() {
           });
         } catch (err) {
           handleFirestoreError(err, OperationType.CREATE, 'users');
+          setError('Conta criada no Auth, mas falhou ao salvar perfil no Firestore (regras/permissão). Peça ao admin para ajustar as regras e tente novamente.');
+          try {
+            await signOut(auth);
+          } catch {}
+          return;
         }
       } else {
         const userCredential = await signInWithEmailAndPassword(auth, email, password);
@@ -1086,11 +1486,101 @@ function App() {
           });
         }
       }
-      setVehicleId(vehicle || 'VTR-DEMO');
+      setVehicleId('');
       setError(null);
     } catch (err: any) {
       console.error(err);
-      setError('Erro no processo. Verifique os dados ou se a conta está bloqueada.');
+      const code = err?.code as string | undefined;
+
+      // Caso especial: e-mail já existe, mas o usuário quer "solicitar cadastro".
+      // Tentamos autenticar e garantir o perfil PENDENTE no Firestore + notificar admin.
+      if (code === 'auth/email-already-in-use' && isRegistering) {
+        try {
+          const cred = await signInWithEmailAndPassword(auth, email, password);
+          const u = cred.user;
+          console.log('UID criado:', u.uid);
+
+          const docRef = doc(db, 'users', u.uid);
+          const snap = await getDocFromServer(docRef).catch(() => getDoc(docRef));
+          const existing = snap.exists() ? (snap.data() as any) : null;
+
+          // Se não existir perfil, cria como PENDENTE
+          if (!existing) {
+            const pendingProfile: UserProfile = {
+              uid: u.uid,
+              name: (formData.get('name') as string) || (u.email ? u.email.split('@')[0] : 'Usuário'),
+              registration: (formData.get('registration') as string) || '',
+              role: 'agent',
+              status: 'PENDENTE',
+              email: u.email || email,
+              biometricEnabled: false,
+              failedAttempts: 0,
+              createdAt: new Date().toISOString(),
+            };
+            await setDoc(docRef, pendingProfile, { merge: true });
+          }
+
+          // Notifica admin (best-effort)
+          try {
+            const idToken = await u.getIdToken();
+            await fetch('/api/registration/request', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${idToken}`,
+              },
+              body: JSON.stringify({
+                name: (formData.get('name') as string) || '',
+                registration: (formData.get('registration') as string) || '',
+                email,
+              }),
+            });
+            await fetch('/api/notifications/pending-user', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${idToken}`,
+              },
+            });
+          } catch (notifyErr) {
+            console.warn('Falha ao notificar admin sobre cadastro pendente (email em uso):', notifyErr);
+          }
+
+          setError('Solicitação registrada. Aguarde a autorização do administrador para acessar o sistema.');
+          try {
+            await signOut(auth);
+          } catch {}
+          return;
+        } catch (e: any) {
+          const c = e?.code as string | undefined;
+          if (c === 'auth/invalid-credential' || c === 'auth/wrong-password') {
+            setError('Este e-mail já existe, mas a senha informada está incorreta. Use a senha correta para registrar a solicitação.');
+            return;
+          }
+          setError('Não foi possível registrar sua solicitação automaticamente. Tente entrar com sua conta e, se ainda não estiver autorizado, o sistema registrará sua solicitação.');
+          return;
+        }
+      }
+
+      const msg =
+        code === 'auth/user-disabled'
+          ? 'Sua conta está bloqueada/desativada no sistema. Peça ao administrador para desbloquear.'
+          : code === 'auth/invalid-credential' || code === 'auth/wrong-password'
+            ? 'E-mail ou senha inválidos. Verifique se digitou corretamente (sem espaços) e tente novamente.'
+          : code === 'auth/user-not-found'
+            ? 'Usuário não encontrado.'
+            : code === 'auth/invalid-email'
+              ? 'E-mail inválido.'
+              : code === 'auth/email-already-in-use'
+                ? 'Este e-mail já está em uso. Clique em "Entrar" com esse e-mail/senha; se ainda não estiver autorizado, o sistema vai registrar sua solicitação para o administrador aprovar.'
+                : code === 'auth/weak-password'
+                  ? 'Senha fraca (mínimo 6 caracteres).'
+                  : code === 'auth/operation-not-allowed'
+                    ? 'Método de login/cadastro desabilitado no Firebase Auth.'
+                    : (err?.message || code)
+                      ? `Falha no login/cadastro: ${code || err.message}`
+                      : 'Erro no processo. Verifique os dados ou se a conta está bloqueada.';
+      setError(msg);
     } finally {
       setLoading(false);
     }
@@ -1101,6 +1591,22 @@ function App() {
 
   useEffect(() => {
     const checkSupport = async () => {
+      // APK (Capacitor): WebAuthn não é confiável no WebView; usamos biometria nativa.
+      if (isNativeApp()) {
+        try {
+          const mod = await import('@capgo/capacitor-native-biometric');
+          const { NativeBiometric } = mod as any;
+          const availability = await NativeBiometric.isAvailable();
+          const ok = !!availability?.isAvailable;
+          setIsBiometricSupported(ok);
+          setBiometricSupportMsg(ok ? 'Suportado e pronto para uso' : 'Não suportado neste dispositivo');
+        } catch (e) {
+          setIsBiometricSupported(false);
+          setBiometricSupportMsg('Não suportado neste dispositivo');
+        }
+        return;
+      }
+
       if (!window.PublicKeyCredential) {
         setIsBiometricSupported(false);
         setBiometricSupportMsg('Não suportado neste navegador');
@@ -1127,10 +1633,57 @@ function App() {
     checkSupport();
   }, []);
 
+  // Admin notifications: pending approvals
+  useEffect(() => {
+    if (!user || !profile) return;
+    if (profile.role !== 'admin' || profile.status !== 'ATIVO') return;
+
+    const qPend = query(collection(db, 'users'), where('status', '==', 'PENDENTE'));
+    const unsub = onSnapshot(qPend, (snap) => {
+      const count = snap.size;
+      setPendingUsersCount(count);
+      if (count > 0 && !hasShownPendingAlertRef.current) {
+        hasShownPendingAlertRef.current = true;
+        // Simples e claro (web + APK). O admin pode abrir o painel e aprovar.
+        alert(`Você tem ${count} cadastro(s) pendente(s) para aprovação no Painel Administrativo.`);
+        setShowAdminPanel(true);
+      }
+    }, (err) => {
+      console.error('Erro ao consultar usuários pendentes:', err);
+    });
+
+    return () => unsub();
+  }, [user, profile]);
+
   const handleBiometricLogin = async () => {
     if (!isBiometricSupported) {
       alert(`Biometria não disponível: ${biometricSupportMsg}`);
       return;
+    }
+
+    // No APK: use biometria nativa como "desbloqueio" de sessão já persistida pelo Firebase.
+    // Se o usuário ainda não tem sessão salva, ele precisa logar 1x com e-mail/senha.
+    if (isNativeApp()) {
+      try {
+        const mod = await import('@capgo/capacitor-native-biometric');
+        const { NativeBiometric } = mod as any;
+        await NativeBiometric.verifyIdentity({
+          reason: 'Autenticação biométrica para acessar o SIGMA-GCM',
+          title: 'SIGMA-GCM',
+          subtitle: 'Confirme sua identidade',
+          description: 'Use sua biometria para desbloquear o acesso',
+        });
+        if (!auth.currentUser) {
+          alert('Biometria confirmada, mas não há sessão salva neste aparelho. Faça login 1 vez com e-mail/senha.');
+          return;
+        }
+        alert('Acesso liberado com biometria!');
+        return;
+      } catch (e: any) {
+        console.error('Native biometrics error:', e);
+        alert('Biometria não disponível ou cancelada.');
+        return;
+      }
     }
 
     const registration = prompt('Informe sua matrícula para login biométrico:');
@@ -1163,12 +1716,13 @@ function App() {
         throw new Error(err.error || 'Falha na verificação biométrica');
       }
 
-      const { token, profile: userProfile } = await verifyRes.json();
-      
-      // Store token (simulated session)
-      localStorage.setItem('sigma_token', token);
-      
-      setProfile(userProfile);
+      const { firebaseCustomToken } = await verifyRes.json();
+      if (!firebaseCustomToken) {
+        throw new Error('Servidor não retornou token do Firebase. Atualize o servidor e tente novamente.');
+      }
+
+      // Troca custom token por sessão Firebase real
+      await signInWithCustomToken(auth, firebaseCustomToken);
       setLastLoginTime(Date.now());
       
       alert('Autenticação biométrica realizada com sucesso!');
@@ -1191,6 +1745,26 @@ function App() {
 
     try {
       setLoading(true);
+
+      // No APK: não usamos WebAuthn; apenas marcamos o perfil como "biometria habilitada".
+      // A autenticação em si é feita localmente via biometria nativa (desbloqueio do app).
+      if (isNativeApp()) {
+        try {
+          const mod = await import('@capgo/capacitor-native-biometric');
+          const { NativeBiometric } = mod as any;
+          await NativeBiometric.verifyIdentity({
+            reason: 'Habilitar biometria para acesso rápido',
+            title: 'SIGMA-GCM',
+          });
+        } catch (e) {
+          throw new Error('Não foi possível validar a biometria neste aparelho.');
+        }
+
+        await updateDoc(doc(db, 'users', profile.uid), { biometricEnabled: true });
+        setProfile({ ...profile, biometricEnabled: true });
+        alert('Biometria habilitada com sucesso neste dispositivo!');
+        return;
+      }
       
       // 1. Get options from server
       const optionsRes = await fetch(`/api/webauthn/register-options?userId=${profile.uid}&userName=${encodeURIComponent(profile.name)}`);
@@ -1232,23 +1806,53 @@ function App() {
     const formData = new FormData(e.currentTarget);
     const name = formData.get('name') as string;
     const registration = formData.get('registration') as string;
-    const role = formData.get('role') as UserRole;
 
     try {
       setLoading(true);
+      const isAdminEmail = user.email === SUPER_ADMIN_EMAIL;
+
       const profileData: UserProfile = {
         uid: user.uid,
         name,
         registration,
-        role: user.email === 'marquesluso.brasileiro@gmail.com' ? 'admin' : role,
-        status: user.email === 'marquesluso.brasileiro@gmail.com' ? 'ATIVO' : 'PENDENTE',
+        // Segurança: ninguém escolhe admin no cadastro. Só e-mails "whitelist" viram admin.
+        role: isAdminEmail ? 'admin' : 'agent',
+        status: isAdminEmail ? 'ATIVO' : 'PENDENTE',
         email: user.email || '',
-        photoUrl: user.photoURL || undefined,
         createdAt: new Date().toISOString()
       };
+      // Firestore NÃO aceita `undefined`. Só adiciona photoUrl se existir.
+      if (user.photoURL) {
+        (profileData as any).photoUrl = user.photoURL;
+      }
 
       const docRef = doc(db, 'users', user.uid);
-      await setDoc(docRef, profileData);
+      await setDoc(docRef, profileData, { merge: true });
+
+      if (!isAdminEmail) {
+        // Notificação interna (backend) para admin aprovar o cadastro.
+        // Best-effort: se falhar, não bloqueia o fluxo.
+        try {
+          const idToken = await user.getIdToken();
+          await fetch('/api/notifications/pending-user', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${idToken}`,
+            },
+          });
+        } catch (notifyErr) {
+          console.warn('Falha ao notificar admin sobre cadastro pendente:', notifyErr);
+        }
+
+        setProfile(null);
+        setError('Cadastro enviado para aprovação do administrador. Aguarde a liberação para acessar.');
+        try {
+          await signOut(auth);
+        } catch {}
+        return;
+      }
+
       setProfile(profileData);
       setError(null);
     } catch (err: any) {
@@ -1262,22 +1866,44 @@ function App() {
   const handleGoogleLogin = async () => {
     try {
       setLoading(true);
-      const provider = new GoogleAuthProvider();
-      await signInWithPopup(auth, provider);
+      // getPlatform() === 'web' é mais confiável que !isNativePlatform() (evita cair no fluxo nativo+Firebase no browser e dar auth/unauthorized-domain).
+      if (Capacitor.getPlatform() === 'web') {
+        window.location.href = '/api/auth/google/start';
+        return;
+      }
+      const result = await GoogleSignIn.signIn();
+      const idToken = result.idToken;
+      if (!idToken) {
+        throw new Error('Google Sign-In não retornou idToken.');
+      }
+      const credential = GoogleAuthProvider.credential(idToken);
+      await signInWithCredential(auth, credential);
       // Profile check and completion will be handled by the UI when profile is null
       setError(null);
     } catch (err: any) {
       console.error(err);
-      setError('Erro ao entrar com Google: ' + (err.message || 'Erro desconhecido'));
-      alert('Erro ao entrar com Google: ' + (err.message || 'Verifique se os popups estão permitidos.'));
+      const code = err?.code as string | undefined;
+      const msg =
+        code === 'auth/unauthorized-domain'
+          ? 'Este domínio não está autorizado no Firebase. Em Authentication → Configurações → Domínios autorizados, inclua exatamente: ' +
+            (typeof window !== 'undefined' ? window.location.hostname : 'seu-site')
+          : code === 'auth/popup-blocked'
+            ? 'O navegador bloqueou o login do Google. Permita pop-ups para este site ou tente outro navegador.'
+            : code === 'auth/popup-closed-by-user'
+              ? 'Login do Google foi cancelado. Tente novamente.'
+              : 'Erro ao entrar com Google: ' + (err.message || 'Erro desconhecido');
+      setError(msg);
+      alert(msg);
     } finally {
       setLoading(false);
     }
   };
 
-  const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file || !profile) return;
+  const processPhotoUpload = async (file: Blob | File) => {
+    if (!profile) {
+      alert('Perfil não carregado. Tente novamente.');
+      return;
+    }
 
     // Validate file size (max 5MB)
     if (file.size > 5 * 1024 * 1024) {
@@ -1285,36 +1911,88 @@ function App() {
       return;
     }
 
-    // Validate file type
-    if (!file.type.startsWith('image/')) {
+    // Validate file type (only if it's a File object)
+    if (file instanceof File && !file.type.startsWith('image/')) {
       alert('Por favor, selecione um arquivo de imagem válido.');
       return;
     }
 
+    const withTimeout = async <T,>(p: Promise<T>, ms: number, label: string): Promise<T> => {
+      let timer: any;
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`TIMEOUT:${label}`)), ms);
+      });
+      try {
+        return await Promise.race([p, timeout]);
+      } finally {
+        try { clearTimeout(timer); } catch {}
+      }
+    };
+
     try {
       setPhotoLoading(true);
-      const storageRef = ref(storage, `profiles/${profile.uid}`);
+      setPhotoLoadingStep('PREPARANDO');
+      const contentType =
+        file instanceof File ? (file.type || 'image/jpeg') : ((file as any).type || 'image/jpeg');
+      const ext =
+        contentType === 'image/png'
+          ? 'png'
+          : contentType === 'image/webp'
+            ? 'webp'
+            : 'jpg';
+      const version = Date.now();
+      const storageRef = ref(storage, `profiles/${profile.uid}/avatar_${version}.${ext}`);
       
-      // Upload to Firebase Storage
-      await uploadBytes(storageRef, file);
+      // Upload to Firebase Storage with timeout
+      setPhotoLoadingStep('UPLOAD');
+      // Em alguns Android WebViews, uploadBytes(Blob) pode "pendurar".
+      // Enviamos como bytes para maior compatibilidade.
+      const bytes = new Uint8Array(await withTimeout(file.arrayBuffer(), 15_000, 'READ_FILE_BYTES'));
+      await withTimeout(
+        uploadBytes(storageRef, bytes, { contentType, cacheControl: 'public,max-age=31536000,immutable' }),
+        45_000,
+        'UPLOAD',
+      );
       
       // Get download URL
-      const photoUrl = await getDownloadURL(storageRef);
+      setPhotoLoadingStep('DOWNLOAD_URL');
+      const photoUrl = await withTimeout(getDownloadURL(storageRef), 20_000, 'DOWNLOAD_URL');
       
       // Update user profile in Firestore
+      setPhotoLoadingStep('FIRESTORE_UPDATE');
       const path = 'users';
-      await updateDoc(doc(db, path, profile.uid), { photoUrl });
+      await withTimeout(
+        updateDoc(doc(db, path, profile.uid), { photoUrl, photoVersion: version }),
+        20_000,
+        'FIRESTORE_UPDATE',
+      );
+
+      // Also update Firebase Auth profile (keeps Google/photo sync consistent across sessions)
+      try {
+        setPhotoLoadingStep('AUTH_PROFILE');
+        const { updateProfile } = await import('firebase/auth');
+        if (auth.currentUser) {
+          await withTimeout(updateProfile(auth.currentUser, { photoURL: photoUrl }), 15_000, 'AUTH_PROFILE');
+        }
+      } catch (e) {
+        console.warn('Falha ao sincronizar photoURL no Firebase Auth (ok):', e);
+      }
       
       // Update local state
-      setProfile({ ...profile, photoUrl });
+      setProfile({ ...profile, photoUrl, photoVersion: version });
       alert('Foto de perfil atualizada com sucesso!');
     } catch (err) {
       console.error('Erro no upload da foto:', err);
-      let errorMessage = 'Erro ao carregar foto.';
+      let errorMessage = 'Erro ao atualizar foto.';
       
       if (err instanceof Error) {
-        if (err.message.includes('storage/unauthorized')) {
+        if (err.message.startsWith('TIMEOUT:')) {
+          const step = err.message.split(':')[1] || 'PROCESSO';
+          errorMessage = `Tempo excedido ao atualizar foto (${step}). Verifique sua conexão e tente novamente.`;
+        } else if (err.message.includes('storage/unauthorized')) {
           errorMessage = 'Sem permissão para upload. Verifique as regras do Firebase Storage.';
+        } else if (err.message.includes('storage/')) {
+          errorMessage = 'Falha no Storage. Verifique conexão/permissões do Firebase Storage.';
         } else {
           errorMessage += ' ' + err.message;
         }
@@ -1323,6 +2001,58 @@ function App() {
       alert(errorMessage);
     } finally {
       setPhotoLoading(false);
+      setPhotoLoadingStep(null);
+      // Reset input value to allow selecting same file again
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    await processPhotoUpload(file);
+  };
+
+  const handlePhotoClick = async () => {
+    if (photoLoading) return;
+
+    if (Capacitor.isNativePlatform()) {
+      try {
+        const image = await Camera.getPhoto({
+          quality: 90,
+          allowEditing: true,
+          resultType: CameraResultType.Uri,
+          source: CameraSource.Prompt,
+          promptLabelHeader: 'Foto de Perfil',
+          promptLabelPhoto: 'Escolher da Galeria',
+          promptLabelPicture: 'Tirar Foto'
+        });
+
+        const pickUrl = image.webPath || (image.path ? Capacitor.convertFileSrc(image.path) : null);
+        if (pickUrl) {
+          // Evita travar indefinidamente em alguns WebViews caso o fetch do arquivo não resolva.
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 15_000);
+          try {
+            const response = await fetch(pickUrl, { signal: controller.signal, cache: 'no-store' });
+            if (!response.ok) {
+              throw new Error(`Falha ao ler imagem (${response.status} ${response.statusText})`);
+            }
+            const blob = await response.blob();
+            if (!blob || blob.size === 0) {
+              throw new Error('Imagem inválida (arquivo vazio).');
+            }
+            await processPhotoUpload(blob);
+          } finally {
+            clearTimeout(timer);
+          }
+        }
+      } catch (err) {
+        console.error('Erro ao capturar foto:', err);
+        // User might have cancelled
+      }
+    } else {
+      fileInputRef.current?.click();
     }
   };
 
@@ -1333,8 +2063,9 @@ function App() {
       setPhotoLoading(true);
       const photoUrl = user.photoURL;
       const path = 'users';
-      await updateDoc(doc(db, path, profile.uid), { photoUrl });
-      setProfile({ ...profile, photoUrl });
+      const version = Date.now();
+      await updateDoc(doc(db, path, profile.uid), { photoUrl, photoVersion: version });
+      setProfile({ ...profile, photoUrl, photoVersion: version });
       alert('Foto sincronizada com o Google!');
     } catch (err) {
       console.error('Erro ao sincronizar foto:', err);
@@ -1344,7 +2075,44 @@ function App() {
     }
   };
 
-  const handleLogout = () => signOut(auth);
+  const handleLogout = async () => {
+    // Se o relatório do plantão estiver pendente, bloqueia logout até enviar.
+    // Checamos na hora do clique para evitar depender apenas do timer.
+    try {
+      if (profile && profile.teamId && profile.role !== 'admin') {
+        const team = teams.find((t) => t.id === profile.teamId);
+        if (team) {
+          const now = new Date();
+          const window = getShiftWindow(now, team.shift);
+          const startIso = window.start.toISOString();
+          const hasReport = recentShiftReports.some(
+            (r) => r.teamId === profile.teamId && r.windowStart === startIso,
+          );
+          // Regra rígida: não permite sair enquanto não existir relatório do plantão atual.
+          if (!hasReport || forceShiftReportModal) {
+            setForceShiftReportWindow({ start: window.start, end: window.end, label: window.label });
+            setForceShiftReportModal(true);
+            setPendingLogoutAfterReport(true);
+            setShowProfileModal(false);
+            alert('Relatório do plantão pendente. Gere e envie o relatório antes de sair.');
+            return;
+          }
+        } else if (forceShiftReportModal) {
+          setShowProfileModal(false);
+          alert('Relatório do plantão pendente. Gere e envie o relatório antes de sair.');
+          return;
+        }
+      } else if (forceShiftReportModal) {
+        setShowProfileModal(false);
+        alert('Relatório do plantão pendente. Gere e envie o relatório antes de sair.');
+        return;
+      }
+    } catch (e) {
+      console.warn('Falha ao validar pendência de relatório no logout:', e);
+      if (forceShiftReportModal) return;
+    }
+    await signOut(auth);
+  };
 
   const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
     const R = 6371e3; // Earth radius in meters
@@ -1414,7 +2182,7 @@ function App() {
 
   const handleSetupTeamVehicle = async (teamData: Partial<Team>) => {
     if (!user || !profile) return;
-    setLoading(true);
+    setSetupTeamVehicleSaving(true);
     try {
       // Create a new team entry for this shift
       const teamRef = await addDoc(collection(db, 'teams'), {
@@ -1430,10 +2198,13 @@ function App() {
         vehicleId: teamData.vehicleId || ''
       };
       
-      await updateDoc(userRef, updatedData);
+      // `setDoc(merge)` evita falha caso o doc ainda não exista (updateDoc falha).
+      await setDoc(userRef, updatedData, { merge: true });
       
       // Update local profile immediately to avoid waiting for snapshot
-      setProfile({ ...profile, ...updatedData });
+      setProfile((prev) => (prev ? { ...prev, ...updatedData } : prev));
+      setTeamId(teamRef.id);
+      setVehicleId(teamData.vehicleId || '');
       
       setShowTeamVehicleSetup(false);
       alert('Plantão configurado com sucesso!');
@@ -1441,17 +2212,80 @@ function App() {
       console.error("Error setting up team/vehicle:", err);
       handleFirestoreError(err, OperationType.UPDATE, 'users');
     } finally {
-      setLoading(false);
+      setSetupTeamVehicleSaving(false);
     }
+  };
+
+  const handleAdminCreateUser = async (data: {
+    name: string;
+    registration: string;
+    email: string;
+    password: string;
+    role: UserRole;
+  }) => {
+    if (!user || !profile) throw new Error('Não autenticado.');
+
+    // 1) Caminho preferido (funciona no APK e no web): cria usuário sem trocar sessão usando Auth secundário
+    try {
+      const { createUserWithEmailAndPassword, updateProfile, signOut } = await import('firebase/auth');
+      const secondaryAuth = await getSecondaryAuth();
+      const cred = await createUserWithEmailAndPassword(secondaryAuth, data.email, data.password);
+      await updateProfile(cred.user, { displayName: data.name });
+
+      const profileData: UserProfile = {
+        uid: cred.user.uid,
+        name: data.name,
+        registration: data.registration,
+        role: data.role,
+        status: 'PENDENTE',
+        email: data.email,
+        biometricEnabled: false,
+        failedAttempts: 0,
+        createdAt: new Date().toISOString(),
+      };
+
+      await setDoc(doc(db, 'users', cred.user.uid), profileData, { merge: true });
+      // Garante que não fica “logado” no auth secundário.
+      await signOut(secondaryAuth);
+      return;
+    } catch (err) {
+      // 2) Fallback opcional: se você quiser manter o backend web, tenta também.
+      // No APK isso deve falhar (sem servidor), então seguimos com a mensagem do erro do caminho 1.
+      console.warn('Admin create via secondary auth failed; trying backend fallback.', err);
+    }
+
+    const idToken = await user.getIdToken();
+    const res = await fetch('/api/admin/create-user', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+      body: JSON.stringify(data),
+    });
+    const json = (await res.json()) as any;
+    if (!res.ok) throw new Error(json?.error || 'Falha ao criar usuário.');
+  };
+
+  const openQrScanner = async () => {
+    if (Capacitor.isNativePlatform()) {
+      try {
+        const perm = await Camera.requestPermissions({ permissions: ['camera'] as any });
+        const state = (perm as any)?.camera ?? (perm as any)?.permissions?.camera;
+        if (state === 'denied') {
+          alert('Permissão de câmera negada. Ative em Configurações do Android > Apps > SIGMA-GCM > Permissões.');
+          return;
+        }
+      } catch (e) {
+        console.error('Camera permission request failed:', e);
+      }
+    }
+    setShowScanner(true);
   };
 
   const [patrolMessage, setPatrolMessage] = useState<string>('');
 
   const handleScan = (qrCode: string) => {
     // console.log("QR Code Scanned:", qrCode);
-    
-    if (!profile || !profile.teamId) {
-      alert('Por favor, selecione uma equipe/viatura antes de realizar a ronda.');
+    if (!profile) {
+      alert('Perfil não carregado. Por favor, faça login novamente.');
       return;
     }
 
@@ -1476,25 +2310,52 @@ function App() {
     setShowScanner(false);
   };
 
-  const confirmPatrol = async (simulatedPos?: { latitude: number, longitude: number }) => {
+  const handleSimulateScan = (property: PublicProperty) => {
+    if (!profile) {
+      alert('Perfil não carregado. Por favor, faça login novamente.');
+      return;
+    }
+    if (!property?.qrCode) {
+      alert('Propriedade inválida para simulação.');
+      return;
+    }
+    // Fecha scanner e abre modal da propriedade.
+    setScannedProperty(property);
+    setShowScanner(false);
+
+    // Em seguida, executa a ronda com posição simulada = coordenadas do próprio ponto (distância 0m).
+    // Usamos um pequeno delay para garantir que o state foi aplicado.
+    setTimeout(() => {
+      void confirmPatrol({ latitude: property.latitude, longitude: property.longitude }, property);
+    }, 50);
+  };
+
+  const confirmPatrol = async (
+    simulatedPos?: { latitude: number, longitude: number },
+    propertyOverride?: PublicProperty,
+  ) => {
     if (!profile) {
       alert('Perfil não carregado. Por favor, faça login novamente.');
       return;
     }
 
     if (!profile.teamId) {
-      alert('Equipe não selecionada. Por favor, configure seu plantão.');
+      // UX: ao invés de apenas alertar, encaminha direto para configurar o plantão.
+      // Fecha o modal atual para não parecer "travado".
+      setScannedProperty(null);
+      setShowTeamVehicleSetup(true);
       return;
     }
 
-    if (!scannedProperty) {
+    const selectedProperty = propertyOverride ?? scannedProperty;
+    if (!selectedProperty) {
       alert('Nenhuma propriedade selecionada.');
       return;
     }
 
     // Validate property coordinates
-    if (typeof scannedProperty.latitude !== 'number' || typeof scannedProperty.longitude !== 'number') {
-      console.error("Invalid property coordinates:", scannedProperty);
+    if (typeof selectedProperty.latitude !== 'number' || typeof selectedProperty.longitude !== 'number') {
+      console.error("Invalid property coordinates:", selectedProperty);
       alert('Erro: Coordenadas da propriedade inválidas ou não encontradas.');
       return;
     }
@@ -1504,7 +2365,7 @@ function App() {
       // console.log("Using simulated position:", simulatedPos);
       setPatrolMessage("Processando localização simulada...");
       setLoading(true);
-      await processPatrol(simulatedPos.latitude, simulatedPos.longitude);
+      await processPatrol(selectedProperty, simulatedPos.latitude, simulatedPos.longitude);
       return;
     }
 
@@ -1527,7 +2388,7 @@ function App() {
     navigator.geolocation.getCurrentPosition(async (pos) => {
       const { latitude, longitude } = pos.coords;
       setPatrolMessage("GPS Recebido. Validando...");
-      await processPatrol(latitude, longitude);
+      await processPatrol(selectedProperty, latitude, longitude);
     }, (err) => {
       console.error("GPS Error:", err);
       let msg = 'Erro ao obter localização GPS.';
@@ -1541,20 +2402,16 @@ function App() {
     }, geoOptions);
   };
 
-  const processPatrol = async (latitude: number, longitude: number) => {
+  const processPatrol = async (property: PublicProperty, latitude: number, longitude: number) => {
     try {
       // console.log("Starting processPatrol with coordinates:", { latitude, longitude });
       
-      if (!scannedProperty) {
-        throw new Error("Dados da propriedade não encontrados. Tente escanear novamente.");
-      }
-
       if (!profile || !profile.teamId) {
         throw new Error("Perfil ou equipe não identificados. Verifique seu plantão.");
       }
 
-      const distance = calculateDistance(latitude, longitude, scannedProperty.latitude, scannedProperty.longitude);
-      // console.log(`Distance to property "${scannedProperty.name}": ${distance.toFixed(2)}m`);
+      const distance = calculateDistance(latitude, longitude, property.latitude, property.longitude);
+      // console.log(`Distance to property "${property.name}": ${distance.toFixed(2)}m`);
 
       // Generate Plus Code for current location
       let currentPlusCode = 'N/A';
@@ -1595,8 +2452,8 @@ function App() {
         inCharge: team.inCharge || 'N/A',
         aux1: team.aux1 || '',
         aux2: team.aux2 || '',
-        propertyId: scannedProperty.id,
-        propertyName: scannedProperty.name,
+        propertyId: property.id,
+        propertyName: property.name,
         plusCode: currentPlusCode,
         timestamp: new Date().toISOString(),
         latitude,
@@ -1614,7 +2471,7 @@ function App() {
         
         setPatrolMessage("Sucesso!");
         // Close modal first for better UX
-        const propName = scannedProperty.name;
+        const propName = property.name;
         setScannedProperty(null);
         
         // Then notify
@@ -1637,6 +2494,11 @@ function App() {
 
   const generateQRCodePDF = async (property: PublicProperty) => {
     try {
+      if (!isMasterAdmin) {
+        alert('Apenas o ADM MASTER tem permissão para imprimir/baixar o QR Code do posto.');
+        return;
+      }
+      const { jsPDF } = await import('jspdf');
       const canvas = document.getElementById('qr-canvas-print') as HTMLCanvasElement;
       if (!canvas) {
         alert('Erro ao gerar QR Code para impressão.');
@@ -1650,36 +2512,30 @@ function App() {
         format: 'a4'
       });
 
-      // Header
-      pdfDoc.setFillColor(0, 33, 71); // Dark blue
-      pdfDoc.rect(0, 0, 210, 40, 'F');
-      
-      pdfDoc.setTextColor(255, 255, 255);
-      pdfDoc.setFontSize(24);
-      pdfDoc.setFont('helvetica', 'bold');
-      pdfDoc.text('SIGMA-GCM', 105, 15, { align: 'center' });
-      
-      pdfDoc.setFontSize(10);
-      pdfDoc.setFont('helvetica', 'normal');
-      pdfDoc.text('Sistema Inteligente de Gestão e Monitoramento Avançado', 105, 22, { align: 'center' });
-      pdfDoc.text('Guarda Civil Municipal de Araçoiaba da Serra', 105, 28, { align: 'center' });
+      await addSigmaHeader(pdfDoc as any, {
+        title: 'SIGMA-GCM',
+        subtitleLine1: 'Sistema Inteligente de Gestão e Monitoramento Avançado da Guarda Civil Municipal',
+        subtitleLine2: 'Guarda Civil Municipal de Araçoiaba da Serra',
+        centerLine: 'QR Code do Local',
+        generatedAt: new Date(),
+      });
 
       // QR Code
-      pdfDoc.addImage(qrImage, 'PNG', 55, 60, 100, 100);
+      pdfDoc.addImage(qrImage, 'PNG', 55, 70, 100, 100);
       
       // Property Info
       pdfDoc.setTextColor(0, 0, 0);
       pdfDoc.setFontSize(18);
       pdfDoc.setFont('helvetica', 'bold');
-      pdfDoc.text(property.name, 105, 175, { align: 'center' });
+      pdfDoc.text(property.name, 105, 185, { align: 'center' });
       
       pdfDoc.setFontSize(12);
       pdfDoc.setFont('helvetica', 'normal');
-      pdfDoc.text(property.address, 105, 185, { align: 'center' });
+      pdfDoc.text(property.address, 105, 195, { align: 'center' });
       
       pdfDoc.setFontSize(14);
       pdfDoc.setFont('helvetica', 'bold');
-      pdfDoc.text(property.qrCode, 105, 200, { align: 'center' });
+      pdfDoc.text(property.qrCode, 105, 210, { align: 'center' });
 
       // Footer
       pdfDoc.setFontSize(8);
@@ -1694,254 +2550,12 @@ function App() {
     }
   };
 
-  const generateReport = async () => {
-    if (!profile) {
-      alert('Perfil não carregado.');
-      return;
-    }
-
-    try {
-      const pdfDoc = new jsPDF();
-      const today = new Date();
-      
-      const todayPatrols = patrols.filter(p => {
-        try {
-          return isToday(new Date(p.timestamp)) && p.teamId === profile?.teamId;
-        } catch (e) {
-          return false;
-        }
-      }).sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-
-      const todayOccurrences = occurrences.filter(o => {
-        try {
-          return isToday(new Date(o.timestamp));
-        } catch (e) {
-          return false;
-        }
-      }).sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
-
-      // Fetch the latest team data directly from Firestore to ensure it's up to date
-      let team: Team | undefined = undefined;
-      if (profile?.teamId) {
-        try {
-          // Force fetch from server to avoid cached stale data
-          const teamDoc = await getDocFromServer(doc(db, 'teams', profile.teamId));
-          if (teamDoc.exists()) {
-            team = { id: teamDoc.id, ...teamDoc.data() } as Team;
-          }
-        } catch (e) {
-          console.error("Error fetching latest team data for report:", e);
-          // Fallback to local state if fetch fails
-          team = teams.find(t => t.id === profile.teamId);
-        }
-      }
-
-      // Function to load image and convert to base64 for jsPDF
-      const getBase64Image = (url: string): Promise<string> => {
-        return new Promise((resolve, reject) => {
-          const img = new Image();
-          img.crossOrigin = 'anonymous';
-          img.onload = () => {
-            const canvas = document.createElement('canvas');
-            canvas.width = img.width;
-            canvas.height = img.height;
-            const ctx = canvas.getContext('2d');
-            if (!ctx) {
-              reject(new Error('Could not get canvas context'));
-              return;
-            }
-            ctx.drawImage(img, 0, 0);
-            resolve(canvas.toDataURL('image/png'));
-          };
-          img.onerror = (e) => {
-            console.error('Error loading image for PDF:', e);
-            reject(new Error('Failed to load image'));
-          };
-          img.src = url;
-        });
-      };
-
-      // Header
-      pdfDoc.setFillColor(0, 33, 71); // Dark blue
-      pdfDoc.rect(0, 0, 210, 45, 'F');
-      
-      // Logo (Upper Left)
-      try {
-        // Using the official GCM Araçoiaba da Serra logo
-        const logoUrl = 'https://i.ibb.co/Vp0yW0m/gcm-aracoiaba.png';
-        const base64Logo = await getBase64Image(logoUrl);
-        pdfDoc.addImage(base64Logo, 'PNG', 10, 5, 35, 35); // Adjusted size and position
-      } catch (e) {
-        console.warn('Could not load logo image, using fallback', e);
-        // Fallback if image fails to load
-        pdfDoc.setDrawColor(255, 255, 255);
-        pdfDoc.setLineWidth(0.5);
-        pdfDoc.circle(30, 22, 12, 'S');
-        pdfDoc.setFontSize(8);
-        pdfDoc.setTextColor(255, 255, 255);
-        pdfDoc.text('GCM', 30, 24, { align: 'center' });
-      }
-
-      pdfDoc.setTextColor(255, 255, 255);
-      pdfDoc.setFontSize(24);
-      pdfDoc.setFont('helvetica', 'bold');
-      pdfDoc.text('SIGMA-GCM', 105, 15, { align: 'center' });
-      
-      pdfDoc.setFontSize(9);
-      pdfDoc.setFont('helvetica', 'italic');
-      pdfDoc.text('Sistema Inteligente de Gestão e Monitoramento Avançado da Guarda Civil Municipal', 105, 21, { align: 'center' });
-      
-      pdfDoc.setFontSize(14);
-      pdfDoc.setFont('helvetica', 'normal');
-      pdfDoc.text('Relatório Operacional de Plantão', 105, 31, { align: 'center' });
-      
-      pdfDoc.setFontSize(9);
-      pdfDoc.text(`Gerado em: ${format(new Date(), 'dd/MM/yyyy HH:mm')}`, 105, 40, { align: 'center' });
-
-      // Info Section
-      pdfDoc.setTextColor(0, 0, 0);
-      pdfDoc.setFontSize(11);
-      pdfDoc.setFont('helvetica', 'bold');
-      pdfDoc.text('DADOS DO PLANTÃO', 20, 55);
-      pdfDoc.line(20, 57, 190, 57);
-
-      pdfDoc.setFontSize(10);
-      pdfDoc.setFont('helvetica', 'normal');
-      pdfDoc.text(`Agente Responsável: ${profile?.name || 'N/A'}`, 20, 65);
-      pdfDoc.text(`Matrícula: ${profile?.registration || 'N/A'}`, 20, 72);
-      pdfDoc.text(`Data do Plantão: ${format(today, 'dd/MM/yyyy')}`, 20, 79);
-
-      pdfDoc.text(`Viatura: ${team?.vehiclePrefix || 'N/A'}`, 110, 65);
-      pdfDoc.text(`Equipe: ${team?.name || 'N/A'}`, 110, 72);
-      pdfDoc.text(`Turno: ${team?.shift || 'N/A'}`, 110, 79);
-
-      // Composition Section
-      pdfDoc.setFont('helvetica', 'bold');
-      pdfDoc.text('COMPOSIÇÃO DA EQUIPE', 20, 92);
-      pdfDoc.line(20, 94, 190, 94);
-
-      pdfDoc.setFont('helvetica', 'normal');
-      pdfDoc.text(`Condutor: ${team?.driver || 'N/A'}`, 20, 102);
-      pdfDoc.text(`Encarregado: ${team?.inCharge || 'N/A'}`, 20, 109);
-      pdfDoc.text(`Auxiliar 01: ${team?.aux1 || '-'}`, 110, 102);
-      pdfDoc.text(`Auxiliar 02: ${team?.aux2 || '-'}`, 110, 109);
-
-      if (team?.members && team.members.length > 0) {
-        pdfDoc.text(`Membros Adicionais: ${team.members.join(', ')}`, 20, 116);
-      }
-
-      // Patrols Table
-      pdfDoc.setFont('helvetica', 'bold');
-      pdfDoc.text('HISTÓRICO DE RONDAS', 20, 125);
-      
-      const patrolTableData = todayPatrols.map(p => [
-        format(new Date(p.timestamp), 'HH:mm'),
-        p.propertyName,
-        p.plusCode || '-',
-        p.status?.toUpperCase() || 'NORMAL',
-        p.observation || '-'
-      ]);
-
-      autoTable(pdfDoc, {
-        startY: 130,
-        head: [['Horário', 'Local / Próprio Público', 'Plus Code', 'Status', 'Observações']],
-        body: patrolTableData,
-        headStyles: { fillColor: [0, 33, 71] },
-        styles: { fontSize: 8 },
-        margin: { left: 20, right: 20 }
-      });
-
-      // Summary
-      let finalY = (pdfDoc as any).lastAutoTable.finalY + 15;
-      pdfDoc.setFont('helvetica', 'bold');
-      pdfDoc.text(`Total de locais visitados: ${todayPatrols.length}`, 20, finalY);
-
-      // Occurrences Section
-      finalY += 15;
-      
-      if (todayOccurrences.length > 0) {
-        if (finalY > 250) {
-          pdfDoc.addPage();
-          finalY = 20;
-        }
-        
-        pdfDoc.setFont('helvetica', 'bold');
-        pdfDoc.text('OCORRÊNCIAS REGISTRADAS', 20, finalY);
-        
-        const occurrenceTableData = todayOccurrences.map(o => [
-          format(new Date(o.timestamp), 'HH:mm'),
-          o.propertyName || 'N/A',
-          o.type,
-          o.description
-        ]);
-
-        autoTable(pdfDoc, {
-          startY: finalY + 5,
-          head: [['Horário', 'Local / Posto', 'Tipo de Ocorrência', 'Descrição / Relato']],
-          body: occurrenceTableData,
-          headStyles: { fillColor: [153, 0, 0] }, // Dark red
-          styles: { fontSize: 9 },
-          margin: { left: 20, right: 20 }
-        });
-        
-        finalY = (pdfDoc as any).lastAutoTable.finalY + 15;
-
-        // Add Photos if any
-        const occurrencesWithPhotos = todayOccurrences.filter(o => o.photoUrl);
-        if (occurrencesWithPhotos.length > 0) {
-          if (finalY > 200) {
-            pdfDoc.addPage();
-            finalY = 20;
-          }
-          pdfDoc.setFont('helvetica', 'bold');
-          pdfDoc.text('ANEXOS FOTOGRÁFICOS (OCORRÊNCIAS)', 20, finalY);
-          finalY += 10;
-
-          for (const occ of occurrencesWithPhotos) {
-            if (finalY > 230) {
-              pdfDoc.addPage();
-              finalY = 20;
-            }
-            pdfDoc.setFont('helvetica', 'normal');
-            pdfDoc.setFontSize(8);
-            pdfDoc.text(`${format(new Date(occ.timestamp), 'HH:mm')} - ${occ.type} (${occ.propertyName || 'N/A'})`, 20, finalY);
-            finalY += 5;
-            try {
-              pdfDoc.addImage(occ.photoUrl!, 'JPEG', 20, finalY, 60, 45);
-              finalY += 55;
-            } catch (e) {
-              console.error('Error adding image to PDF:', e);
-              pdfDoc.text('[Erro ao carregar imagem]', 20, finalY);
-              finalY += 10;
-            }
-          }
-        }
-      } else {
-        finalY += 10;
-        pdfDoc.setFont('helvetica', 'italic');
-        pdfDoc.text('Nenhuma ocorrência registrada neste plantão.', 20, finalY);
-        finalY += 20;
-      }
-
-      pdfDoc.line(60, finalY + 10, 150, finalY + 10);
-      pdfDoc.setFont('helvetica', 'normal');
-      pdfDoc.setFontSize(10);
-      pdfDoc.text('Assinatura do Agente Responsável', 105, finalY + 18, { align: 'center' });
-      pdfDoc.text(`${profile?.name} - GCM`, 105, finalY + 25, { align: 'center' });
-
-      pdfDoc.save(`Relatorio_Plantao_${profile?.registration || 'GCM'}_${format(today, 'yyyyMMdd')}.pdf`);
-      alert('Relatório gerado com sucesso!');
-    } catch (err) {
-      console.error('Erro ao gerar PDF:', err);
-      alert('Erro ao gerar o relatório: ' + (err instanceof Error ? err.message : String(err)));
-    }
-  };
 
   // --- Renderers ---
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-blue-900 flex flex-col items-center justify-center text-white p-6">
+      <div className="min-h-dvh bg-blue-900 flex flex-col items-center justify-center text-white p-6 safe-pt safe-pb">
         <Shield className="w-16 h-16 animate-pulse mb-4" />
         <h1 className="text-2xl font-bold tracking-widest">SIGMA-GCM</h1>
         <p className="text-blue-200 mt-2">Carregando sistema...</p>
@@ -1950,16 +2564,23 @@ function App() {
   }
 
   if (user && !profile) {
+    const isAdminEmail = user.email === SUPER_ADMIN_EMAIL;
     return (
-      <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-6">
+      <div className="min-h-dvh bg-gray-50 flex flex-col items-center justify-center p-6 safe-pt safe-pb">
         <motion.div 
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           className="w-full max-w-md"
         >
           <div className="text-center mb-8">
-            <div className="inline-flex p-4 bg-blue-900 rounded-2xl shadow-xl mb-4">
-              <Shield className="w-12 h-12 text-white" />
+            <div className="mx-auto h-24 w-24 rounded-2xl overflow-hidden shadow-xl mb-4 bg-blue-900">
+              <img
+                src={appLogo}
+                alt="SIGMA-GCM"
+                className="h-full w-full object-cover"
+                loading="eager"
+                decoding="async"
+              />
             </div>
             <h1 className="text-3xl font-bold text-gray-900">Concluir Cadastro</h1>
             <p className="text-gray-500 mt-1">Olá, {user.displayName}! Complete seus dados para acessar o sistema.</p>
@@ -1984,11 +2605,31 @@ function App() {
               />
               <div className="space-y-1.5">
                 <label className="text-sm font-medium text-gray-700">Perfil de Acesso</label>
-                <select name="role" className="w-full bg-gray-50 border border-gray-200 rounded-lg py-2.5 px-4 text-gray-900 focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 outline-none transition-all">
-                  <option value="agent">Agente Operacional</option>
-                  <option value="supervisor">Supervisor de Dia</option>
-                  <option value="admin">Administrador</option>
-                </select>
+                {isAdminEmail ? (
+                  <>
+                    <select
+                      disabled
+                      className="w-full bg-gray-50 border border-gray-200 rounded-lg py-2.5 px-4 text-gray-900 focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 outline-none transition-all opacity-70 cursor-not-allowed"
+                    >
+                      <option value="admin">Administrador</option>
+                    </select>
+                    <p className="text-[11px] text-gray-500 font-medium">
+                      Conta administrativa reconhecida. O acesso será liberado automaticamente após concluir.
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <select
+                      disabled
+                      className="w-full bg-gray-50 border border-gray-200 rounded-lg py-2.5 px-4 text-gray-900 focus:ring-2 focus:ring-blue-900/20 focus:border-blue-900 outline-none transition-all opacity-70 cursor-not-allowed"
+                    >
+                      <option value="agent">Agente Operacional</option>
+                    </select>
+                    <p className="text-[11px] text-gray-500 font-medium">
+                      O perfil e a liberação de acesso serão definidos pelo administrador.
+                    </p>
+                  </>
+                )}
               </div>
 
               {error && <p className="text-red-600 text-sm font-medium">{error}</p>}
@@ -1999,7 +2640,7 @@ function App() {
 
               <button 
                 type="button"
-                onClick={() => signOut(auth)}
+                onClick={handleLogout}
                 className="w-full text-sm text-gray-500 font-semibold hover:underline mt-4"
               >
                 Sair e entrar com outra conta
@@ -2013,15 +2654,21 @@ function App() {
 
   if (!user) {
     return (
-      <div className="min-h-screen bg-gray-50 flex flex-col items-center justify-center p-6">
+      <div className="min-h-dvh bg-gray-50 flex flex-col items-center justify-center p-6 safe-pt safe-pb">
         <motion.div 
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
           className="w-full max-w-md"
         >
           <div className="text-center mb-8">
-            <div className="inline-flex p-4 bg-blue-900 rounded-2xl shadow-xl mb-4">
-              <Shield className="w-12 h-12 text-white" />
+            <div className="mx-auto h-24 w-24 rounded-2xl overflow-hidden shadow-xl mb-4 bg-blue-900">
+              <img
+                src={appLogo}
+                alt="SIGMA-GCM"
+                className="h-full w-full object-cover"
+                loading="eager"
+                decoding="async"
+              />
             </div>
             <h1 className="text-3xl font-bold text-gray-900">SIGMA-GCM</h1>
             <p className="text-gray-500 mt-1">Gestão e Monitoramento Avançado</p>
@@ -2062,15 +2709,6 @@ function App() {
                 icon={Shield}
                 required
               />
-              {!isRegistering && (
-                <Input 
-                  name="vehicle"
-                  label="Identificação da Viatura" 
-                  placeholder="VTR-123" 
-                  icon={Truck}
-                  required
-                />
-              )}
 
               <div className="space-y-1.5">
                 <label className="text-sm font-medium text-gray-700">Perfil de Acesso</label>
@@ -2145,9 +2783,9 @@ function App() {
     );
   }
 
-  if (user && profile && profile.status === 'PENDENTE' && user.email !== 'marquesluso.brasileiro@gmail.com') {
+  if (user && profile && profile.status === 'PENDENTE' && user.email !== SUPER_ADMIN_EMAIL) {
     return (
-      <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
+      <div className="min-h-dvh bg-slate-900 flex items-center justify-center p-4 safe-pt safe-pb">
         <motion.div 
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
@@ -2162,7 +2800,7 @@ function App() {
             Você será notificado assim que seu acesso for liberado.
           </p>
           <Button 
-            onClick={() => signOut(auth)}
+            onClick={handleLogout}
             className="w-full"
             variant="outline"
           >
@@ -2173,9 +2811,9 @@ function App() {
     );
   }
 
-  if (user && profile && profile.status === 'BLOQUEADO' && user.email !== 'marquesluso.brasileiro@gmail.com') {
+  if (user && profile && profile.status === 'BLOQUEADO' && user.email !== SUPER_ADMIN_EMAIL) {
     return (
-      <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4">
+      <div className="min-h-dvh bg-slate-900 flex items-center justify-center p-4 safe-pt safe-pb">
         <motion.div 
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
@@ -2190,7 +2828,7 @@ function App() {
             Entre em contato com o comando para mais informações.
           </p>
           <Button 
-            onClick={() => signOut(auth)}
+            onClick={handleLogout}
             className="w-full"
             variant="outline"
           >
@@ -2202,28 +2840,37 @@ function App() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-50 pb-24">
+    <div className="min-h-dvh bg-gray-50 pb-24 safe-pb">
       <AnimatePresence>
-        {showAdminPanel && (profile || user?.email === 'marquesluso.brasileiro@gmail.com') && (
-          <AdminPanel 
-            profile={profile || { uid: user!.uid, name: user!.displayName || 'Admin', email: user!.email!, role: 'admin', status: 'ATIVO', registration: 'ADMIN', createdAt: new Date().toISOString() }} 
-            onClose={() => setShowAdminPanel(false)} 
-            logAdminAction={logAdminAction}
-          />
+        {showAdminPanel && (profile || user?.email === SUPER_ADMIN_EMAIL) && (
+          <React.Suspense fallback={null}>
+            <AdminPanel 
+              profile={profile || { uid: user!.uid, name: user!.displayName || 'Admin', email: user!.email!, role: 'admin', status: 'ATIVO', registration: 'ADMIN', createdAt: new Date().toISOString() }} 
+              onClose={() => setShowAdminPanel(false)} 
+              logAdminAction={logAdminAction}
+            />
+          </React.Suspense>
         )}
       </AnimatePresence>
       {/* Header */}
       <header className={cn(
-        "bg-blue-900 text-white p-6 rounded-b-[2.5rem] shadow-lg sticky top-0 z-[1000] transition-all duration-300",
-        activeTab === 'map' ? "p-4 rounded-b-none" : "p-6 rounded-b-[2.5rem]"
+        "bg-blue-900 text-white p-4 sm:p-6 rounded-b-3xl sm:rounded-b-[2.5rem] shadow-lg sticky top-0 z-[1000] transition-all duration-300",
+        activeTab === 'map' ? "p-3 sm:p-4 rounded-b-none" : "p-4 sm:p-6 rounded-b-3xl sm:rounded-b-[2.5rem]",
+        isHeaderCollapsed ? "py-2 sm:py-3 overflow-hidden" : undefined
       )}>
-        <div className={cn("flex items-center justify-between", activeTab === 'map' ? "mb-0" : "mb-4")}>
+        <div className={cn("flex items-center justify-between gap-2", activeTab === 'map' ? "mb-0" : "mb-3 sm:mb-4")}>
           <div className="flex items-center gap-3">
-            <div className="p-2 bg-white/10 rounded-lg">
-              <Shield className="w-6 h-6" />
+            <div className="w-11 h-11 sm:w-12 sm:h-12 bg-white/10 rounded-xl overflow-hidden shadow-sm border border-white/10">
+              <img
+                src={appLogo}
+                alt="SIGMA-GCM"
+                className="w-full h-full object-cover"
+                loading="eager"
+                decoding="async"
+              />
             </div>
             <div>
-              <h1 className="font-bold text-lg leading-tight">SIGMA-GCM</h1>
+              <h1 className="font-bold text-base sm:text-lg leading-tight">SIGMA-GCM</h1>
               {activeTab !== 'map' && (
                 <p className="text-blue-200 text-[10px] uppercase tracking-widest font-bold">
                   Sistema de Gestão Municipal
@@ -2232,14 +2879,21 @@ function App() {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            {(profile?.role === 'admin' || user?.email === 'marquesluso.brasileiro@gmail.com') && (
+            {(profile?.role === 'admin' || user?.email === SUPER_ADMIN_EMAIL) && (
               <button 
                 onClick={() => setShowAdminPanel(true)} 
-                className="flex items-center gap-2 px-3 py-1.5 bg-amber-500/20 text-amber-300 rounded-full hover:bg-amber-500/30 transition-colors"
+                className="relative flex items-center gap-2 px-2.5 sm:px-3 py-1.5 bg-amber-500/20 text-amber-300 rounded-full hover:bg-amber-500/30 transition-colors"
                 title="Painel Administrativo"
               >
+                {pendingUsersCount > 0 && (
+                  <span
+                    className="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full ring-2 ring-blue-900"
+                    aria-label={`${pendingUsersCount} cadastro(s) pendente(s)`}
+                    title={`${pendingUsersCount} cadastro(s) pendente(s)`}
+                  />
+                )}
                 <Shield className="w-4 h-4" />
-                <span className="text-xs font-bold uppercase tracking-wider">Admin</span>
+                <span className="hidden sm:inline text-xs font-bold uppercase tracking-wider">Admin</span>
               </button>
             )}
             {activeTab === 'map' && (
@@ -2248,6 +2902,17 @@ function App() {
                 <span className="text-[10px] font-bold uppercase tracking-wider">Live</span>
               </div>
             )}
+            <button
+              type="button"
+              onClick={() => {
+                setShowTeamDetails(false);
+                setIsHeaderCollapsed((v) => !v);
+              }}
+              className="p-2 bg-white/10 rounded-full hover:bg-white/20 transition-colors"
+              title={isHeaderCollapsed ? 'Mostrar cabeçalho' : 'Ocultar cabeçalho'}
+            >
+              {isHeaderCollapsed ? <ChevronDown className="w-5 h-5" /> : <X className="w-5 h-5" />}
+            </button>
             <button onClick={handleLogout} className="p-2 bg-white/10 rounded-full hover:bg-white/20 transition-colors">
               <LogOut className="w-5 h-5" />
             </button>
@@ -2255,7 +2920,7 @@ function App() {
         </div>
 
         {/* Operational Info Banner */}
-        {profile?.teamId && activeTab !== 'map' && (
+        {!isHeaderCollapsed && profile?.teamId && activeTab !== 'map' && (
           <div className="bg-white/10 rounded-2xl mb-4 backdrop-blur-md border border-white/10 overflow-hidden">
             {(() => {
               const team = teams.find(t => t.id === profile.teamId);
@@ -2437,7 +3102,7 @@ function App() {
           </div>
         )}
 
-        {activeTab !== 'map' && (
+        {!isHeaderCollapsed && activeTab !== 'map' && (
           <div 
             onClick={() => setShowProfileModal(true)}
             className="flex items-center gap-4 bg-white/10 p-4 rounded-2xl backdrop-blur-sm cursor-pointer hover:bg-white/20 transition-all active:scale-[0.98] border border-white/5"
@@ -2445,7 +3110,12 @@ function App() {
             <div className="relative">
               <div className="w-14 h-14 rounded-full bg-gradient-to-br from-blue-600 to-blue-800 flex items-center justify-center font-bold text-xl border-2 border-white/20 overflow-hidden shadow-inner">
                 {profile?.photoUrl ? (
-                  <img src={profile.photoUrl} alt="Perfil" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                  <img
+                    src={`${profile.photoUrl}${profile.photoVersion ? `?v=${profile.photoVersion}` : ''}`}
+                    alt="Perfil"
+                    className="w-full h-full object-cover"
+                    referrerPolicy="no-referrer"
+                  />
                 ) : (
                   <span className="text-white/90">{profile?.name?.[0] || '?'}</span>
                 )}
@@ -2469,25 +3139,27 @@ function App() {
       </header>
 
       {activeTab === 'map' && (
-        <div style={{ height: "100vh", width: "100%" }} className="fixed inset-0 z-0 overflow-hidden">
-          <MapComponent 
-            patrols={patrols} 
-            occurrences={occurrences} 
-            properties={properties}
-            vehicleLocations={vehicleLocations}
-            geofences={geofences}
-            alerts={alerts}
-            userRole={profile?.role}
-            onStartPatrol={(prop) => {
-              setSelectedPropertyForQR(prop);
-              setShowScanner(true);
-            }}
-          />
+        <div style={{ height: "100dvh", width: "100%" }} className="fixed inset-0 z-0 overflow-hidden">
+          <React.Suspense fallback={null}>
+            <MapComponent 
+              patrols={patrols} 
+              occurrences={occurrences} 
+              properties={properties}
+              vehicleLocations={vehicleLocations}
+              geofences={geofences}
+              alerts={alerts}
+              userRole={profile?.role}
+              onStartPatrol={(prop) => {
+                setSelectedPropertyForQR(prop);
+                void openQrScanner();
+              }}
+            />
+          </React.Suspense>
         </div>
       )}
 
       {/* Main Content */}
-      <main className="p-6 max-w-4xl mx-auto space-y-6">
+      <main className="p-3 sm:p-6 max-w-4xl mx-auto space-y-4 sm:space-y-6">
         
         {activeTab === 'home' && (
           <motion.div 
@@ -2498,7 +3170,9 @@ function App() {
             {/* Quick Actions */}
             <div className="grid grid-cols-2 gap-4">
               <button 
-                onClick={() => setShowScanner(true)}
+                onClick={() => {
+                  void openQrScanner();
+                }}
                 className="flex flex-col items-center justify-center p-6 bg-white rounded-2xl shadow-sm border border-gray-100 hover:border-blue-900 transition-all group"
               >
                 <div className="p-3 bg-blue-50 rounded-xl mb-3 group-hover:bg-blue-900 group-hover:text-white transition-all">
@@ -2509,7 +3183,9 @@ function App() {
               </button>
 
               <button 
-                onClick={() => setShowOccurrenceModal(true)}
+                onClick={() => {
+                  setShowOccurrenceModal(true);
+                }}
                 className="flex flex-col items-center justify-center p-6 bg-white rounded-2xl shadow-sm border border-gray-100 hover:border-red-600 transition-all group"
               >
                 <div className="p-3 bg-red-50 rounded-xl mb-3 group-hover:bg-red-600 group-hover:text-white transition-all">
@@ -2524,7 +3200,9 @@ function App() {
               variant="outline" 
               className="w-full bg-white" 
               size="lg"
-              onClick={generateEndOfShiftReport}
+              onClick={() => {
+                void generateEndOfShiftReport();
+              }}
             >
               <FileText className="w-5 h-5" />
               Gerar Relatório de Plantão
@@ -2541,20 +3219,31 @@ function App() {
               </div>
 
               <div className="space-y-3">
-                {patrols.slice(0, 5).map((patrol) => (
-                  <Card key={patrol.id} className="p-4 flex items-center justify-between">
-                    <div className="flex items-center gap-3">
-                      <div className="w-10 h-10 rounded-full bg-green-50 flex items-center justify-center">
-                        <CheckCircle2 className="w-6 h-6 text-green-600" />
-                      </div>
-                      <div>
-                        <h4 className="font-bold text-gray-900">{patrol.propertyName}</h4>
-                        <p className="text-xs text-blue-600 font-mono font-bold mt-0.5">{patrol.plusCode}</p>
-                        <p className="text-xs text-gray-500 mt-1">{format(new Date(patrol.timestamp), 'HH:mm')} • {patrol.vehicleId}</p>
-                      </div>
+                {groupByDay<PatrolRecord>(patrols.slice(0, 5)).map((group) => (
+                  <div key={group.key} className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <div className="h-px flex-1 bg-gray-200" />
+                      <span className="text-[11px] font-bold uppercase tracking-wider text-gray-400 whitespace-nowrap">
+                        {group.label}
+                      </span>
+                      <div className="h-px flex-1 bg-gray-200" />
                     </div>
-                    <ChevronRight className="w-5 h-5 text-gray-300" />
-                  </Card>
+                    {group.items.map((patrol) => (
+                      <Card key={patrol.id} className="p-4 flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                          <div className="w-10 h-10 rounded-full bg-green-50 flex items-center justify-center">
+                            <CheckCircle2 className="w-6 h-6 text-green-600" />
+                          </div>
+                          <div>
+                            <h4 className="font-bold text-gray-900">{patrol.propertyName}</h4>
+                            <p className="text-xs text-blue-600 font-mono font-bold mt-0.5">{patrol.plusCode}</p>
+                            <p className="text-xs text-gray-500 mt-1">{format(new Date(patrol.timestamp), 'HH:mm')} • {patrol.vehicleId}</p>
+                          </div>
+                        </div>
+                        <ChevronRight className="w-5 h-5 text-gray-300" />
+                      </Card>
+                    ))}
+                  </div>
                 ))}
                 {patrols.length === 0 && (
                   <div className="text-center py-12 bg-white rounded-2xl border border-dashed border-gray-200">
@@ -2598,73 +3287,93 @@ function App() {
 
             <div className="space-y-3">
               {historyTab === 'patrols' ? (
-                patrols.map((patrol) => (
-                  <Card key={patrol.id} className="p-4">
-                    <div className="flex justify-between items-start mb-2">
-                      <div>
-                        <h4 className="font-bold text-gray-900">{patrol.propertyName}</h4>
-                        <p className="text-xs text-blue-600 font-mono font-bold mt-0.5">{patrol.plusCode}</p>
-                        <p className="text-sm text-gray-500 mt-1">{format(new Date(patrol.timestamp), 'dd/MM/yyyy HH:mm')}</p>
-                      </div>
-                      <Badge variant={patrol.status === 'normal' ? 'success' : patrol.status === 'attention' ? 'warning' : 'error'}>
-                        {patrol.status?.toUpperCase() || 'N/A'}
-                      </Badge>
+                groupByDay<PatrolRecord>(patrols).map((group) => (
+                  <div key={group.key} className="space-y-2">
+                    <div className="flex items-center gap-2 sticky top-0 bg-gray-50/80 backdrop-blur-sm py-2 z-10">
+                      <span className="text-xs font-bold text-gray-500 uppercase tracking-wider">
+                        {group.label}
+                      </span>
+                      <div className="h-px flex-1 bg-gray-200" />
                     </div>
-                    <div className="flex items-center justify-between mt-4">
-                      <div className="flex items-center gap-4 text-xs text-gray-400">
-                        <span className="flex items-center gap-1"><User className="w-3 h-3" /> {patrol.agentName}</span>
-                        <span className="flex items-center gap-1"><Truck className="w-3 h-3" /> {patrol.vehicleId}</span>
-                      </div>
-                      <Button 
-                        size="sm" 
-                        variant="ghost" 
-                        className="h-8 text-blue-900 hover:bg-blue-50"
-                        onClick={() => window.open(`https://www.google.com/maps/search/?api=1&query=${patrol.latitude},${patrol.longitude}`, '_blank')}
-                      >
-                        <MapPin className="w-3 h-3 mr-1" />
-                        Ver no Mapa
-                      </Button>
-                    </div>
-                    <p className="mt-2 text-sm text-gray-600 italic">"{patrol.observation}"</p>
-                  </Card>
+                    {group.items.map((patrol) => (
+                      <Card key={patrol.id} className="p-4">
+                        <div className="flex justify-between items-start mb-2">
+                          <div>
+                            <h4 className="font-bold text-gray-900">{patrol.propertyName}</h4>
+                            <p className="text-xs text-blue-600 font-mono font-bold mt-0.5">{patrol.plusCode}</p>
+                            <p className="text-sm text-gray-500 mt-1">{format(new Date(patrol.timestamp), 'dd/MM/yyyy HH:mm')}</p>
+                          </div>
+                          <Badge variant={patrol.status === 'normal' ? 'success' : patrol.status === 'attention' ? 'warning' : 'error'}>
+                            {patrol.status?.toUpperCase() || 'N/A'}
+                          </Badge>
+                        </div>
+                        <div className="flex items-center justify-between mt-4">
+                          <div className="flex items-center gap-4 text-xs text-gray-400">
+                            <span className="flex items-center gap-1"><User className="w-3 h-3" /> {patrol.agentName}</span>
+                            <span className="flex items-center gap-1"><Truck className="w-3 h-3" /> {patrol.vehicleId}</span>
+                          </div>
+                          <Button 
+                            size="sm" 
+                            variant="ghost" 
+                            className="h-8 text-blue-900 hover:bg-blue-50"
+                            onClick={() => window.open(`https://www.google.com/maps/search/?api=1&query=${patrol.latitude},${patrol.longitude}`, '_blank')}
+                          >
+                            <MapPin className="w-3 h-3 mr-1" />
+                            Ver no Mapa
+                          </Button>
+                        </div>
+                        <p className="mt-2 text-sm text-gray-600 italic">"{patrol.observation}"</p>
+                      </Card>
+                    ))}
+                  </div>
                 ))
               ) : (
-                occurrences.map((occ) => (
-                  <Card key={occ.id} className="p-4 border-l-4 border-l-red-500">
-                    <div className="flex justify-between items-start mb-2">
-                      <div>
-                        <h4 className="font-bold text-gray-900">{occ.type}</h4>
-                        <p className="text-xs text-red-600 font-bold mt-0.5">{occ.propertyName || 'Local não informado'}</p>
-                        <p className="text-sm text-gray-500 mt-1">{format(new Date(occ.timestamp), 'dd/MM/yyyy HH:mm')}</p>
-                      </div>
-                      <Badge variant="error">OCORRÊNCIA</Badge>
+                groupByDay<OccurrenceRecord>(occurrences).map((group) => (
+                  <div key={group.key} className="space-y-2">
+                    <div className="flex items-center gap-2 sticky top-0 bg-gray-50/80 backdrop-blur-sm py-2 z-10">
+                      <span className="text-xs font-bold text-gray-500 uppercase tracking-wider">
+                        {group.label}
+                      </span>
+                      <div className="h-px flex-1 bg-gray-200" />
                     </div>
-                    
-                    <p className="mt-2 text-sm text-gray-700 bg-gray-50 p-3 rounded-lg border border-gray-100">
-                      {occ.description}
-                    </p>
+                    {group.items.map((occ) => (
+                      <Card key={occ.id} className="p-4 border-l-4 border-l-red-500">
+                        <div className="flex justify-between items-start mb-2">
+                          <div>
+                            <h4 className="font-bold text-gray-900">{occ.type}</h4>
+                            <p className="text-xs text-red-600 font-bold mt-0.5">{occ.propertyName || 'Local não informado'}</p>
+                            <p className="text-sm text-gray-500 mt-1">{format(new Date(occ.timestamp), 'dd/MM/yyyy HH:mm')}</p>
+                          </div>
+                          <Badge variant="error">OCORRÊNCIA</Badge>
+                        </div>
+                        
+                        <p className="mt-2 text-sm text-gray-700 bg-gray-50 p-3 rounded-lg border border-gray-100">
+                          {occ.description}
+                        </p>
 
-                    {occ.photoUrl && (
-                      <div className="mt-3 rounded-xl overflow-hidden border border-gray-200">
-                        <img src={occ.photoUrl} alt="Evidência" className="w-full h-48 object-cover" />
-                      </div>
-                    )}
+                        {occ.photoUrl && (
+                          <div className="mt-3 rounded-xl overflow-hidden border border-gray-200">
+                            <img src={occ.photoUrl} alt="Evidência" className="w-full h-48 object-cover" />
+                          </div>
+                        )}
 
-                    <div className="flex items-center justify-between mt-4">
-                      <div className="flex items-center gap-4 text-xs text-gray-400">
-                        <span className="flex items-center gap-1"><User className="w-3 h-3" /> {occ.agentName}</span>
-                      </div>
-                      <Button 
-                        size="sm" 
-                        variant="ghost" 
-                        className="h-8 text-red-600 hover:bg-red-50"
-                        onClick={() => window.open(`https://www.google.com/maps/search/?api=1&query=${occ.latitude},${occ.longitude}`, '_blank')}
-                      >
-                        <MapPin className="w-3 h-3 mr-1" />
-                        Localização
-                      </Button>
-                    </div>
-                  </Card>
+                        <div className="flex items-center justify-between mt-4">
+                          <div className="flex items-center gap-4 text-xs text-gray-400">
+                            <span className="flex items-center gap-1"><User className="w-3 h-3" /> {occ.agentName}</span>
+                          </div>
+                          <Button 
+                            size="sm" 
+                            variant="ghost" 
+                            className="h-8 text-red-600 hover:bg-red-50"
+                            onClick={() => window.open(`https://www.google.com/maps/search/?api=1&query=${occ.latitude},${occ.longitude}`, '_blank')}
+                          >
+                            <MapPin className="w-3 h-3 mr-1" />
+                            Localização
+                          </Button>
+                        </div>
+                      </Card>
+                    ))}
+                  </div>
                 ))
               )}
               {((historyTab === 'patrols' && patrols.length === 0) || (historyTab === 'occurrences' && occurrences.length === 0)) && (
@@ -2683,20 +3392,22 @@ function App() {
             animate={{ opacity: 1, y: 0 }}
             className="space-y-6 pb-20"
           >
-            <StrategicDashboard 
-              profile={profile!}
-              patrols={patrols}
-              occurrences={occurrences}
-              properties={properties}
-              vehicleLocations={vehicleLocations}
-              alerts={alerts}
-              teams={teams}
-              vehicles={vehicles}
-              geofences={geofences}
-              onGenerateReport={generateEndOfShiftReport}
-              onResolveAlert={handleResolveAlert}
-              onTriggerAlert={handleTriggerAlert}
-            />
+            <React.Suspense fallback={null}>
+              <StrategicDashboard 
+                profile={profile!}
+                patrols={patrols}
+                occurrences={occurrences}
+                properties={properties}
+                vehicleLocations={vehicleLocations}
+                alerts={alerts}
+                teams={teams}
+                vehicles={vehicles}
+                geofences={geofences}
+                onGenerateReport={generateEndOfShiftReport}
+                onResolveAlert={handleResolveAlert}
+                onTriggerAlert={handleTriggerAlert}
+              />
+            </React.Suspense>
           </motion.div>
         )}
 
@@ -2709,7 +3420,7 @@ function App() {
             <div className="flex items-center justify-between">
               <h3 className="text-xl font-bold text-gray-900">Próprios Públicos</h3>
               <div className="flex gap-2">
-                {(profile?.role === 'supervisor' || profile.role === 'command') && (
+                {isMasterAdmin && (
                   <>
                     <Button 
                       size="sm" 
@@ -2804,26 +3515,30 @@ function App() {
                           {prop.status === 'operational' ? 'OPERACIONAL' : 'MANUTENÇÃO'}
                         </span>
                       </div>
-                      <div className="flex gap-2">
-                        <button 
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleEditProperty(prop);
-                          }}
-                          className="p-1.5 bg-gray-100 text-gray-600 rounded-lg hover:bg-blue-100 hover:text-blue-900 transition-all"
-                        >
-                          <Edit2 className="w-3.5 h-3.5" />
-                        </button>
-                        <button 
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleDeleteProperty(prop.id, prop.name);
-                          }}
-                          className="p-1.5 bg-gray-100 text-gray-600 rounded-lg hover:bg-red-100 hover:text-red-600 transition-all"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
+                      {isMasterAdmin && (
+                        <div className="flex gap-2">
+                          <button 
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleEditProperty(prop);
+                            }}
+                            className="p-1.5 bg-gray-100 text-gray-600 rounded-lg hover:bg-blue-100 hover:text-blue-900 transition-all"
+                            title="Editar posto"
+                          >
+                            <Edit2 className="w-3.5 h-3.5" />
+                          </button>
+                          <button 
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              handleDeleteProperty(prop.id, prop.name);
+                            }}
+                            className="p-1.5 bg-gray-100 text-gray-600 rounded-lg hover:bg-red-100 hover:text-red-600 transition-all"
+                            title="Excluir posto"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      )}
                     </div>
                   </div>
                   
@@ -2936,13 +3651,15 @@ function App() {
         )}
 
         {activeTab === 'manual' && (
-          <SystemManual onClose={() => setActiveTab('home')} />
+          <React.Suspense fallback={null}>
+            <SystemManual onClose={() => setActiveTab('home')} />
+          </React.Suspense>
         )}
 
       </main>
 
       {/* Bottom Navigation */}
-      <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-100 px-4 py-3 flex items-center justify-between z-40 overflow-x-auto scrollbar-hide">
+      <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-100 px-4 py-3 safe-pb flex items-center justify-between z-40 overflow-x-auto scrollbar-hide">
         <NavButton active={activeTab === 'home'} onClick={() => setActiveTab('home')} icon={Shield} label="Início" />
         <NavButton active={activeTab === 'map'} onClick={() => setActiveTab('map')} icon={MapIcon} label="Mapa" />
         <NavButton active={activeTab === 'history'} onClick={() => setActiveTab('history')} icon={History} label="Rondas" />
@@ -2959,12 +3676,76 @@ function App() {
 
       {/* Modals */}
       <AnimatePresence>
+        {forceShiftReportModal && (
+          <div className="fixed inset-0 bg-black/70 backdrop-blur-sm z-[2500] flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0, scale: 0.97, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.97, y: 20 }}
+              className="bg-white rounded-3xl w-full max-w-md overflow-hidden shadow-2xl border border-gray-100"
+            >
+              <div className="bg-blue-900 p-6 text-white">
+                <h3 className="text-xl font-bold">Relatório obrigatório</h3>
+                <p className="text-blue-200 text-sm mt-1">
+                  O plantão foi encerrado e o relatório ainda não foi enviado ao ADM MASTER.
+                </p>
+              </div>
+
+              <div className="p-6 space-y-4">
+                <div className="bg-amber-50 border border-amber-200 text-amber-900 rounded-2xl p-4 text-sm leading-relaxed">
+                  <p className="font-bold">Ação necessária</p>
+                  <p className="mt-1">
+                    Para continuar usando o sistema ou sair, você precisa <b>gerar e enviar</b> o relatório deste plantão.
+                  </p>
+                  {forceShiftReportWindow && (
+                    <p className="mt-2 text-xs text-amber-900/80">
+                      Turno: <b>{forceShiftReportWindow.label}</b> • Período:{' '}
+                      <b>{format(forceShiftReportWindow.start, 'dd/MM HH:mm')}</b> –{' '}
+                      <b>{format(forceShiftReportWindow.end, 'dd/MM HH:mm')}</b>
+                    </p>
+                  )}
+                </div>
+
+                <Button
+                  size="lg"
+                  className="w-full"
+                  disabled={forceShiftReportLoading}
+                  onClick={async () => {
+                    setForceShiftReportLoading(true);
+                    try {
+                      await generateEndOfShiftReport();
+                      // Se enviou com sucesso, fecha o modal e, se o usuário tentou sair,
+                      // conclui o logout automaticamente.
+                      setForceShiftReportModal(false);
+                      setForceShiftReportWindow(null);
+                      if (pendingLogoutAfterReport) {
+                        setPendingLogoutAfterReport(false);
+                        await signOut(auth);
+                      }
+                    } finally {
+                      setForceShiftReportLoading(false);
+                    }
+                  }}
+                >
+                  {forceShiftReportLoading ? 'Enviando...' : 'Gerar e Enviar Relatório'}
+                </Button>
+
+                <p className="text-[11px] text-gray-400 leading-relaxed">
+                  O relatório será enviado automaticamente para o painel do ADM MASTER em{' '}
+                  <b>Painel Administrativo → Relatórios</b>.
+                </p>
+              </div>
+            </motion.div>
+          </div>
+        )}
         {showTeamVehicleSetup && (
           <TeamVehicleSetupModal 
             teams={teams} 
             vehicles={vehicles} 
-            loading={loading}
+            loading={setupTeamVehicleSaving}
             onSave={handleSetupTeamVehicle} 
+            canCreateUsers={profile?.role === 'admin' || profile?.role === 'supervisor' || profile?.role === 'command'}
+            onCreateUser={handleAdminCreateUser}
           />
         )}
         {showSyncConfirmModal && (
@@ -3238,7 +4019,7 @@ function App() {
                         const { id, ...data } = editingProperty;
                         await updateDoc(doc(db, 'properties', id), data);
                         setShowEditPropertyModal(false);
-                        alert('Local atualizado com sucesso!');
+                        // Evita alerta modal persistente no navegador/Android; feedback vem pela atualização em tempo real.
                       } catch (err) {
                         handleFirestoreError(err, OperationType.UPDATE, 'properties');
                       } finally {
@@ -3369,7 +4150,7 @@ function App() {
                           latitude: -23.5042,
                           longitude: -47.4831
                         });
-                        alert('Local cadastrado com sucesso!');
+                        // Evita alerta modal persistente no navegador/Android; o novo local aparece na lista via onSnapshot.
                       } catch (err) {
                         handleFirestoreError(err, OperationType.CREATE, 'properties');
                       } finally {
@@ -3386,12 +4167,12 @@ function App() {
         )}
 
         {selectedPropertyForQR && (
-          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[2000] flex items-center justify-center p-4">
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[2000] flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
             <motion.div 
               initial={{ opacity: 0, scale: 0.9, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.9, y: 20 }}
-              className="bg-white rounded-[2.5rem] w-full max-w-sm overflow-hidden shadow-2xl p-8 text-center space-y-6"
+              className="bg-white rounded-3xl sm:rounded-[2.5rem] w-full max-w-sm overflow-hidden shadow-2xl p-5 sm:p-8 text-center space-y-5 sm:space-y-6 my-6"
             >
               <div className="flex justify-between items-center">
                 <h3 className="text-xl font-bold text-gray-900">QR Code do Local</h3>
@@ -3414,21 +4195,32 @@ function App() {
                 <Button variant="outline" className="flex-1" onClick={() => setSelectedPropertyForQR(null)}>
                   Fechar
                 </Button>
-                <Button className="flex-1" onClick={() => generateQRCodePDF(selectedPropertyForQR)}>
-                  <Download className="w-4 h-4" /> Imprimir
-                </Button>
+                {isMasterAdmin ? (
+                  <Button className="flex-1" onClick={() => generateQRCodePDF(selectedPropertyForQR)}>
+                    <Download className="w-4 h-4" /> Imprimir
+                  </Button>
+                ) : (
+                  <Button
+                    className="flex-1"
+                    variant="secondary"
+                    disabled
+                    title="Somente o ADM MASTER pode imprimir o QR Code"
+                  >
+                    <Lock className="w-4 h-4" /> Bloqueado
+                  </Button>
+                )}
               </div>
             </motion.div>
           </div>
         )}
 
         {scannedProperty && (
-          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[2000] flex items-center justify-center p-4">
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[2000] flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
             <motion.div 
               initial={{ opacity: 0, scale: 0.9, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
               exit={{ opacity: 0, scale: 0.9, y: 20 }}
-              className="bg-white rounded-[2.5rem] w-full max-w-sm overflow-hidden shadow-2xl p-8 space-y-6"
+              className="bg-white rounded-3xl sm:rounded-[2.5rem] w-full max-w-sm overflow-hidden shadow-2xl p-5 sm:p-8 space-y-5 sm:space-y-6 my-6"
             >
               <div className="text-center space-y-2">
                 <div className="w-16 h-16 bg-blue-50 rounded-2xl flex items-center justify-center mx-auto mb-4">
@@ -3437,6 +4229,15 @@ function App() {
                 <Badge variant="info">{scannedProperty.category}</Badge>
                 <h3 className="text-2xl font-bold text-gray-900">{scannedProperty.name}</h3>
                 <p className="text-gray-500 text-sm">{scannedProperty.address}</p>
+                {(() => {
+                  const host = window.location.hostname;
+                  const isLocalhost = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+                  return isLocalhost ? (
+                    <p className="text-[10px] text-gray-400 font-mono mt-2">
+                      BUILD: {__BUILD_ID__}
+                    </p>
+                  ) : null;
+                })()}
               </div>
 
               <div className="bg-gray-50 p-4 rounded-2xl space-y-3">
@@ -3462,7 +4263,18 @@ function App() {
                 </Button>
                 <Button 
                   className="flex-1" 
-                  onClick={() => confirmPatrol()}
+                  onClick={() => {
+                    const host = window.location.hostname;
+                    const isLocalhost = host === 'localhost' || host === '127.0.0.1' || host === '::1';
+                    if (isLocalhost && scannedProperty) {
+                      confirmPatrol(
+                        { latitude: scannedProperty.latitude, longitude: scannedProperty.longitude },
+                        scannedProperty,
+                      );
+                    } else {
+                      confirmPatrol();
+                    }
+                  }}
                   disabled={loading}
                 >
                   {loading ? (patrolMessage || 'Processando...') : 'Confirmar Ronda'}
@@ -3483,7 +4295,7 @@ function App() {
                       confirmPatrol({ 
                         latitude: scannedProperty.latitude, 
                         longitude: scannedProperty.longitude 
-                      });
+                      }, scannedProperty);
                     }
                   }}
                   className="text-[10px] text-gray-400 hover:text-blue-600 transition-colors uppercase font-bold tracking-widest"
@@ -3502,7 +4314,7 @@ function App() {
             exit={{ opacity: 0 }}
             className="fixed inset-0 bg-black z-[2000] flex flex-col"
           >
-            <div className="p-6 flex items-center justify-between text-white">
+            <div className="p-4 sm:p-6 flex items-center justify-between text-white">
               <div className="flex flex-col">
                 <h3 className="font-bold text-lg">Escanear QR Code</h3>
                 <span id="scanner-status" className="text-[10px] text-white/40 uppercase tracking-widest">Iniciando câmera...</span>
@@ -3512,7 +4324,7 @@ function App() {
               </button>
             </div>
             
-            <div className="flex-1 flex flex-col items-center justify-center p-6 gap-6">
+            <div className="flex-1 flex flex-col items-center justify-center p-4 sm:p-6 gap-4 sm:gap-6 overflow-y-auto">
               <div 
                 id="reader" 
                 className="w-full max-w-sm rounded-2xl overflow-hidden border-4 border-blue-900 bg-black relative min-h-[300px]"
@@ -3526,11 +4338,11 @@ function App() {
               {/* Simulation for testing */}
               <div className="w-full max-w-sm space-y-3">
                 <p className="text-white/40 text-[10px] uppercase font-bold text-center">Simulação de Teste</p>
-                <div className="grid grid-cols-2 gap-2">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                   {properties.slice(0, 4).map(p => (
                     <button 
                       key={p.id}
-                      onClick={() => handleScan(p.qrCode)}
+                      onClick={() => handleSimulateScan(p)}
                       className="text-[10px] bg-white/5 hover:bg-white/10 text-white/60 p-2 rounded-lg border border-white/10 truncate"
                     >
                       Simular: {p.name}
@@ -3542,7 +4354,7 @@ function App() {
               <ScannerInitializer onScan={handleScan} />
             </div>
 
-            <div className="p-12 text-center text-white/60">
+            <div className="p-6 sm:p-12 text-center text-white/60">
               <p className="text-sm">Aponte a câmera para o QR Code fixado no local.</p>
               <p className="text-xs mt-2">A validação GPS será realizada automaticamente.</p>
             </div>
@@ -3569,21 +4381,31 @@ function App() {
                   <div className="w-24 h-24 rounded-full bg-blue-900 flex items-center justify-center text-white text-4xl font-bold shadow-xl border-4 border-blue-50 overflow-hidden relative">
                     {photoLoading && (
                       <div className="absolute inset-0 bg-black/50 flex items-center justify-center z-10">
-                        <div className="w-8 h-8 border-4 border-white border-t-transparent rounded-full animate-spin"></div>
+                        <div className="flex flex-col items-center gap-2">
+                          <div className="w-8 h-8 border-4 border-white border-t-transparent rounded-full animate-spin"></div>
+                          <div className="text-[10px] font-black tracking-widest text-white/90">
+                            {photoLoadingStep || 'PROCESSANDO'}
+                          </div>
+                        </div>
                       </div>
                     )}
                     {profile?.photoUrl ? (
-                      <img src={profile.photoUrl} alt="Perfil" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
+                      <img
+                        src={`${profile.photoUrl}${profile.photoVersion ? `?v=${profile.photoVersion}` : ''}`}
+                        alt="Perfil"
+                        className="w-full h-full object-cover"
+                        referrerPolicy="no-referrer"
+                      />
                     ) : (
                       profile?.name?.[0] || '?'
                     )}
                   </div>
                   <button 
-                    onClick={() => fileInputRef.current?.click()}
+                    onClick={handlePhotoClick}
                     disabled={photoLoading}
                     className="absolute bottom-0 right-0 p-2 bg-blue-900 text-white rounded-full shadow-lg border-2 border-white hover:bg-blue-800 transition-all disabled:opacity-50"
                   >
-                    <Camera className="w-4 h-4" />
+                    <CameraIcon className="w-4 h-4" />
                   </button>
                   <input 
                     type="file" 
@@ -3780,6 +4602,7 @@ function App() {
                     await addDoc(collection(db, path), {
                       agentId: profile?.uid,
                       agentName: profile?.name,
+                      teamId: profile?.teamId,
                       timestamp: new Date().toISOString(),
                       description,
                       type,
@@ -3881,7 +4704,7 @@ function App() {
                     className="w-full" 
                     onClick={() => document.getElementById('occurrence-photo')?.click()}
                   >
-                    <Camera className="w-5 h-5 mr-2" /> 
+                    <CameraIcon className="w-5 h-5 mr-2" /> 
                     {occurrencePhoto ? 'Alterar Foto' : 'Anexar Foto'}
                   </Button>
                 </div>
@@ -3941,6 +4764,7 @@ const ScannerInitializer = ({ onScan }: { onScan: (data: string) => void }) => {
         if (statusEl) statusEl.innerText = "Acessando câmera...";
 
         // Use the lower-level API for more control
+        const { Html5Qrcode } = await import('html5-qrcode');
         html5QrCode = new Html5Qrcode("reader");
         
         const config = { 
@@ -4007,7 +4831,7 @@ class AppErrorBoundary extends Component<any, any> {
   render() {
     if (this.state.hasError) {
       return (
-        <div className="min-h-screen bg-red-50 flex flex-col items-center justify-center p-6 text-center">
+        <div className="min-h-dvh bg-red-50 flex flex-col items-center justify-center p-6 text-center safe-pt safe-pb">
           <AlertTriangle className="w-16 h-16 text-red-600 mb-4" />
           <h1 className="text-2xl font-bold text-gray-900 mb-2">Ops! Algo deu errado.</h1>
           <p className="text-gray-600 mb-6 max-w-md">

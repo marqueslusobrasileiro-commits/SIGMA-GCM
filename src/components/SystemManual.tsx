@@ -299,16 +299,16 @@ export const SystemManual: React.FC<SystemManualProps> = ({ onClose }) => {
         <div 
           ref={manualRef} 
           id="manual-content"
-          className="max-w-4xl mx-auto bg-white rounded-3xl shadow-2xl overflow-hidden text-slate-800"
+          className="max-w-4xl mx-auto bg-white rounded-2xl sm:rounded-3xl shadow-2xl overflow-hidden text-slate-800"
         >
           {/* Cover / Intro */}
-          <div className="bg-blue-900 p-12 text-center text-white relative overflow-hidden">
+          <div className="bg-blue-900 p-6 sm:p-12 text-center text-white relative overflow-hidden">
             <div className="absolute top-0 left-0 w-full h-full opacity-10 pointer-events-none">
               <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-white via-transparent to-transparent" />
             </div>
-            <Shield className="w-20 h-20 mx-auto mb-6 text-blue-400" />
-            <h1 className="text-4xl font-black mb-4 tracking-tight">SIGMA-GCM</h1>
-            <p className="text-xl text-blue-200 font-medium max-w-2xl mx-auto">
+            <Shield className="w-14 h-14 sm:w-20 sm:h-20 mx-auto mb-4 sm:mb-6 text-blue-400" />
+            <h1 className="text-3xl sm:text-4xl font-black mb-3 sm:mb-4 tracking-tight">SIGMA-GCM</h1>
+            <p className="text-base sm:text-xl text-blue-200 font-medium max-w-2xl mx-auto">
               Manual de Uso Institucional, Técnico e Operacional
             </p>
             <div className="mt-8 inline-flex items-center gap-2 px-4 py-2 bg-white/10 rounded-full text-xs font-bold uppercase tracking-widest">
@@ -316,7 +316,7 @@ export const SystemManual: React.FC<SystemManualProps> = ({ onClose }) => {
             </div>
           </div>
 
-          <div className="p-10 sm:p-16 space-y-20">
+          <div className="p-5 sm:p-16 space-y-12 sm:space-y-20">
             {/* 1. Apresentação */}
             <section className="space-y-8">
               <div className="flex items-center gap-5 text-blue-900">
@@ -328,7 +328,7 @@ export const SystemManual: React.FC<SystemManualProps> = ({ onClose }) => {
                   <div className="h-1 w-20 bg-blue-900 mt-1 rounded-full" />
                 </div>
               </div>
-              <div className="bg-slate-50 p-10 rounded-[2.5rem] border border-slate-100 leading-relaxed text-xl text-slate-700 shadow-inner">
+              <div className="bg-slate-50 p-5 sm:p-10 rounded-3xl sm:rounded-[2.5rem] border border-slate-100 leading-relaxed text-base sm:text-xl text-slate-700 shadow-inner">
                 O <span className="font-bold text-blue-900">SIGMA-GCM</span> (Sistema Integrado de Gestão e Monitoramento de Atividades) é a ferramenta oficial de patrulhamento da Guarda Civil Municipal. Desenvolvido para maximizar a eficiência operacional, o sistema integra geolocalização em tempo real, auditoria de rondas via QR Code e gestão centralizada de ocorrências.
               </div>
             </section>

@@ -1,5 +1,5 @@
-export type UserRole = 'agent' | 'supervisor' | 'admin';
-export type UserStatus = 'PENDENTE' | 'ATIVO' | 'BLOQUEADO';
+export type UserRole = 'agent' | 'supervisor' | 'admin' | 'command';
+export type UserStatus = 'PENDENTE' | 'ATIVO' | 'BLOQUEADO' | 'DESATIVADO';
 
 export interface UserProfile {
   uid: string;
@@ -11,6 +11,7 @@ export interface UserProfile {
   vehicleId?: string;
   teamId?: string;
   photoUrl?: string;
+  photoVersion?: number;
   biometricEnabled?: boolean;
   failedAttempts?: number;
   lockedUntil?: string;
@@ -20,7 +21,11 @@ export interface UserProfile {
 export interface Team {
   id: string;
   name: string;
-  shift: 'Manhã' | 'Tarde' | 'Noite' | '12x36';
+  /**
+   * Turnos operacionais.
+   * Mantém valores legados ('Manhã'|'Tarde'|'Noite') para compatibilidade com dados já gravados.
+   */
+  shift: 'Diurno' | 'Intermediário' | 'Noturno' | '12x36' | 'Manhã' | 'Tarde' | 'Noite';
   vehicleId: string;
   vehiclePrefix: string;
   driver: string;
@@ -98,6 +103,8 @@ export interface PublicProperty {
   manager?: string;
   status: 'operational' | 'maintenance' | 'closed';
   lastVisit?: string;
+  deletedAt?: string | null;
+  deletedBy?: string | null;
 }
 
 export interface PatrolRecord {
@@ -135,6 +142,7 @@ export interface OccurrenceRecord {
   latitude: number;
   longitude: number;
   photoUrl?: string;
+  teamId?: string;
 }
 
 export interface AuditLog {
@@ -146,4 +154,26 @@ export interface AuditLog {
   targetId?: string;
   targetType?: 'user' | 'property' | 'vehicle' | 'team' | 'alert';
   timestamp: string;
+}
+
+export interface ShiftReport {
+  id: string;
+  createdAt: string;
+  filename: string;
+  downloadUrl?: string;
+  storagePath?: string;
+  agentId: string;
+  agentName: string;
+  registration?: string;
+  teamId?: string;
+  teamName?: string;
+  vehiclePrefix?: string;
+  shift: string;
+  windowStart: string;
+  windowEnd: string;
+  delivery?: 'storage' | 'server' | 'email' | 'none';
+  emailTo?: string;
+  emailSentAt?: string;
+  deletedAt?: string | null;
+  deletedBy?: string | null;
 }

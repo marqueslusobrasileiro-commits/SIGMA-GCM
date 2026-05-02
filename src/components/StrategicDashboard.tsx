@@ -8,7 +8,7 @@ import {
   TrendingUp, 
   AlertTriangle, 
   Users, 
-  Truck, 
+  CarFront, 
   Activity,
   Zap,
   Target,
@@ -138,23 +138,23 @@ export const StrategicDashboard: React.FC<StrategicDashboardProps> = ({
   const COLORS = ['#0f2c63', '#1e8e3e', '#f9ab00', '#d93025', '#081a3a', '#266abf'];
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-200 p-6 space-y-6 font-sans">
+    <div className="min-h-screen bg-slate-950 text-slate-200 p-3 sm:p-6 space-y-4 sm:space-y-6 font-sans">
       {/* Header */}
-      <div className="flex items-center justify-between border-b border-slate-800 pb-6">
-        <div className="flex items-center gap-4">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between border-b border-slate-800 pb-4 sm:pb-6 gap-4">
+        <div className="flex items-center gap-3 sm:gap-4">
           <div className="p-3 bg-blue-500/10 rounded-2xl border border-blue-500/20">
             <Monitor className="w-8 h-8 text-blue-400" />
           </div>
           <div>
-            <h1 className="text-2xl font-black uppercase tracking-tighter text-white">Centro de Comando e Controle</h1>
+            <h1 className="text-xl sm:text-2xl font-black uppercase tracking-tighter text-white">Centro de Comando e Controle</h1>
             <p className="text-slate-400 text-xs font-bold uppercase tracking-widest flex items-center gap-2">
               <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse" />
               Monitoramento Estratégico em Tempo Real
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-6">
-          <div className="text-right">
+        <div className="flex items-center justify-between sm:justify-end gap-4 sm:gap-6">
+          <div className="text-left sm:text-right">
             <p className="text-[10px] font-bold text-slate-500 uppercase tracking-widest">Status Global</p>
             <p className="text-sm font-black text-green-400 uppercase">Operacional</p>
           </div>
@@ -197,7 +197,7 @@ export const StrategicDashboard: React.FC<StrategicDashboardProps> = ({
           progress={stats.coverage}
         />
         <IndicatorCard 
-          icon={Truck} 
+          icon={CarFront} 
           label="Viaturas em Campo" 
           value={stats.activeVehicles.toString()} 
           subValue={`${stats.activeTeams} equipes ativas`}
@@ -353,7 +353,7 @@ export const StrategicDashboard: React.FC<StrategicDashboardProps> = ({
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
                       <div className="w-10 h-10 bg-blue-500/10 rounded-xl flex items-center justify-center text-blue-400 border border-blue-500/20">
-                        <Truck className="w-5 h-5" />
+                        <CarFront className="w-5 h-5" />
                       </div>
                       <div>
                         <h5 className="text-sm font-black text-white leading-none mb-1">{loc.vehiclePrefix}</h5>

@@ -1,19 +1,22 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { 
   Users, 
   MapPin, 
   Truck, 
   History, 
   Shield, 
+  FileText,
+  Plus,
+  Edit2,
   CheckCircle2, 
   XCircle, 
   AlertTriangle, 
   Search, 
-  Plus, 
-  Edit2, 
   Trash2, 
   Lock, 
   Unlock,
+  Printer,
+  Bell,
   ChevronRight,
   ChevronLeft,
   Filter,
@@ -35,9 +38,15 @@ import {
   where,
   getDocs
 } from 'firebase/firestore';
-import { db } from '../firebase';
-import { UserProfile, PublicProperty, Team, Vehicle, AuditLog, UserStatus, UserRole } from '../types';
+import { onAuthStateChanged } from 'firebase/auth';
+import { auth, db } from '../firebase';
+import { UserProfile, PublicProperty, Team, Vehicle, AuditLog, UserStatus, UserRole, ShiftReport } from '../types';
 import { format } from 'date-fns';
+import { SUPER_ADMIN_EMAIL } from '../config';
+import { groupByDayBy } from '../lib/groupByDay';
+import { Capacitor } from '@capacitor/core';
+import { apiFetch, getApiBaseUrl } from '../lib/apiClient';
+import { sharePdfBlob } from '../lib/nativePdf';
 
 interface AdminPanelProps {
   profile: UserProfile;
@@ -46,23 +55,202 @@ interface AdminPanelProps {
 }
 
 export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdminAction }) => {
-  const [activeTab, setActiveTab] = useState<'users' | 'properties' | 'vehicles' | 'teams' | 'logs'>('users');
+  const [activeTab, setActiveTab] = useState<'users' | 'properties' | 'vehicles' | 'teams' | 'logs' | 'reports'>('users');
+  const [reportsView, setReportsView] = useState<'active' | 'trash'>('active');
+  const [propertiesView, setPropertiesView] = useState<'active' | 'trash'>('active');
+  const [selectedPropertyIds, setSelectedPropertyIds] = useState<Set<string>>(new Set());
   const [users, setUsers] = useState<UserProfile[]>([]);
+  const [pendingCount, setPendingCount] = useState<number>(0);
+  const [pendingFsUsers, setPendingFsUsers] = useState<UserProfile[]>([]);
+  const [pendingApiUsers, setPendingApiUsers] = useState<UserProfile[]>([]);
+  const [pendingApiError, setPendingApiError] = useState<string | null>(null);
   const [properties, setProperties] = useState<PublicProperty[]>([]);
   const [vehicles, setVehicles] = useState<Vehicle[]>([]);
   const [teams, setTeams] = useState<Team[]>([]);
   const [logs, setLogs] = useState<AuditLog[]>([]);
+  const [reports, setReports] = useState<ShiftReport[]>([]);
+  const [sendingReportEmailIds, setSendingReportEmailIds] = useState<Set<string>>(new Set());
+  const [hasUnreadReports, setHasUnreadReports] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [authWarning, setAuthWarning] = useState<string | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
   const [filterStatus, setFilterStatus] = useState<UserStatus | 'ALL'>('ALL');
-  const [showUserModal, setShowUserModal] = useState(false);
-  const [editingUser, setEditingUser] = useState<UserProfile | null>(null);
   const [showPropertyModal, setShowPropertyModal] = useState(false);
   const [editingProperty, setEditingProperty] = useState<PublicProperty | null>(null);
   const [showVehicleModal, setShowVehicleModal] = useState(false);
   const [editingVehicle, setEditingVehicle] = useState<Vehicle | null>(null);
   const [showTeamModal, setShowTeamModal] = useState(false);
   const [editingTeam, setEditingTeam] = useState<Team | null>(null);
+
+  const isLocalhost =
+    typeof window !== 'undefined' &&
+    (window.location.hostname === 'localhost' ||
+      window.location.hostname === '127.0.0.1' ||
+      window.location.hostname.endsWith('.local'));
+
+  const isVitePreviewPort =
+    typeof window !== 'undefined' && (window.location.port === '4173' || window.location.port === '5173');
+
+  const isMasterAdmin = (profile.email || '').toLowerCase() === SUPER_ADMIN_EMAIL.toLowerCase();
+  const activeReports = reports.filter((r) => !r.deletedAt);
+  const trashedReports = reports.filter((r) => !!r.deletedAt);
+  const visibleReports = reportsView === 'trash' ? trashedReports : activeReports;
+
+  const activeProperties = properties.filter((p) => !p.deletedAt);
+  const trashedProperties = properties.filter((p) => !!p.deletedAt);
+  const visibleProperties = propertiesView === 'trash' ? trashedProperties : activeProperties;
+
+  const visiblePropertyIds = useMemo(() => visibleProperties.map((p) => p.id), [visibleProperties]);
+  const allVisiblePropertiesSelected = useMemo(() => {
+    if (visiblePropertyIds.length === 0) return false;
+    for (const id of visiblePropertyIds) if (!selectedPropertyIds.has(id)) return false;
+    return true;
+  }, [selectedPropertyIds, visiblePropertyIds]);
+  const someVisiblePropertiesSelected = useMemo(() => {
+    for (const id of visiblePropertyIds) if (selectedPropertyIds.has(id)) return true;
+    return false;
+  }, [selectedPropertyIds, visiblePropertyIds]);
+
+  const selectAllRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    if (!selectAllRef.current) return;
+    selectAllRef.current.indeterminate = someVisiblePropertiesSelected && !allVisiblePropertiesSelected;
+  }, [someVisiblePropertiesSelected, allVisiblePropertiesSelected]);
+
+  const platoonOrder = ['ALPHA', 'BRAVO', 'CHARLIE', 'DELTA', 'OUTROS'] as const;
+  type Platoon = (typeof platoonOrder)[number];
+  const platoonFromTeamName = (teamName?: string | null): Platoon => {
+    const name = String(teamName || '').toUpperCase();
+    for (const p of platoonOrder) {
+      if (p !== 'OUTROS' && name.includes(p)) return p;
+    }
+    return 'OUTROS';
+  };
+  const platoonShiftHint: Partial<Record<Platoon, 'Noturno' | 'Diurno'>> = {
+    BRAVO: 'Noturno',
+    DELTA: 'Noturno',
+  };
+
+  const fetchReportPdfBlob = async (reportId: string): Promise<Blob> => {
+    const u = auth.currentUser;
+    if (!u) throw new Error('Sessão expirada.');
+    const token = await u.getIdToken();
+    const resp = await apiFetch(`/api/shift-reports/file/${encodeURIComponent(reportId)}`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      throw new Error(text || `Falha ao baixar PDF (HTTP ${resp.status})`);
+    }
+
+    const contentType = (resp.headers.get('content-type') || '').toLowerCase();
+    const blob = await resp.blob();
+
+    // Garante que recebemos um PDF de verdade (no APK é comum salvar JSON/HTML como ".pdf" sem perceber).
+    if (!contentType.includes('application/pdf')) {
+      const txt = await blob.text().catch(() => '');
+      // tenta extrair erro JSON {error:"..."}
+      try {
+        const parsed = JSON.parse(txt);
+        const msg = typeof parsed?.error === 'string' ? parsed.error : txt;
+        throw new Error(msg || `Resposta inválida do servidor (Content-Type: ${contentType || 'desconhecido'})`);
+      } catch {
+        throw new Error(
+          (txt && txt.slice(0, 300)) ||
+            `Resposta inválida do servidor (Content-Type: ${contentType || 'desconhecido'})`,
+        );
+      }
+    }
+
+    // Verifica assinatura "%PDF-" nos primeiros bytes
+    try {
+      const head = new Uint8Array(await blob.slice(0, 5).arrayBuffer());
+      const sig = String.fromCharCode(...Array.from(head));
+      if (sig !== '%PDF-') {
+        throw new Error('Arquivo recebido não parece ser um PDF válido.');
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new Error(msg || 'Falha ao validar PDF.');
+    }
+
+    return blob;
+  };
+
+  const downloadBlob = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || 'relatorio.pdf';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 2000);
+  };
+
+  const openBlobForPrint = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    const w = window.open(url, '_blank', 'noopener,noreferrer');
+    if (!w) {
+      downloadBlob(blob, filename);
+      return;
+    }
+    // Alguns navegadores bloqueiam print automático; ainda assim abrimos o PDF para o ADM imprimir.
+    const tryPrint = () => {
+      try { w.focus(); w.print(); } catch {}
+    };
+    w.addEventListener?.('load', tryPrint);
+    window.setTimeout(tryPrint, 1200);
+    window.setTimeout(() => URL.revokeObjectURL(url), 60_000);
+  };
+
+  const isShareCanceledError = (e: unknown): boolean => {
+    const msg = (e instanceof Error ? e.message : String(e || '')).toLowerCase();
+    return msg.includes('share canceled') || msg.includes('share cancelled') || msg.includes('canceled') || msg.includes('cancelled');
+  };
+
+  const isShareBusyError = (e: unknown): boolean => {
+    const msg = (e instanceof Error ? e.message : String(e || '')).toLowerCase();
+    return msg.includes("can't share while sharing is in progress");
+  };
+
+  const markSendingEmail = (reportId: string, sending: boolean) => {
+    setSendingReportEmailIds((prev) => {
+      const next = new Set(prev);
+      if (sending) next.add(reportId);
+      else next.delete(reportId);
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    // Relatórios de plantão (metadados + link do Storage)
+    const qReports = query(collection(db, 'shift_reports'), orderBy('createdAt', 'desc'), limit(200));
+    const unsubReports = onSnapshot(qReports, (snap) => {
+      setReports(snap.docs.map(d => ({ id: d.id, ...(d.data() as Omit<ShiftReport, 'id'>) })));
+    });
+    return () => unsubReports();
+  }, []);
+
+  // Notificação de novos relatórios (badge no tab "Relatórios")
+  useEffect(() => {
+    const uid = profile?.uid || 'anonymous';
+    const storageKey = `admin:lastSeenReportsAt:${uid}`;
+    const lastSeenIso = localStorage.getItem(storageKey);
+    const lastSeenMs = lastSeenIso ? new Date(lastSeenIso).getTime() : 0;
+    const newestMs = activeReports.length > 0 ? new Date(activeReports[0].createdAt).getTime() : 0;
+    setHasUnreadReports(newestMs > lastSeenMs);
+  }, [profile?.uid, activeReports]);
+
+  useEffect(() => {
+    if (activeTab !== 'reports') return;
+    const uid = profile?.uid || 'anonymous';
+    const storageKey = `admin:lastSeenReportsAt:${uid}`;
+    const newestIso = activeReports.length > 0 ? activeReports[0].createdAt : new Date().toISOString();
+    localStorage.setItem(storageKey, newestIso);
+    setHasUnreadReports(false);
+  }, [activeTab, profile?.uid, activeReports]);
 
   const handleSaveVehicle = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
@@ -153,19 +341,27 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
       longitude: Number(formData.get('longitude')),
       plusCode: formData.get('plusCode') as string,
       qrCode: formData.get('qrCode') as string || `GCM-${Date.now()}`,
-      status: 'operational' as const
+      status: 'operational' as const,
+      deletedAt: null as string | null,
+      deletedBy: null as string | null,
     };
 
     try {
       if (editingProperty) {
         await updateDoc(doc(db, 'properties', editingProperty.id), propData);
-        await logAdminAction(profile, 'EDIÇÃO DE POSTO', `Posto ${propData.name} editado.`, editingProperty.id, 'property');
+        // Fecha o modal imediatamente após salvar o Firestore.
+        // Auditoria roda em segundo plano para não travar UX.
+        setShowPropertyModal(false);
+        setEditingProperty(null);
+        void logAdminAction(profile, 'EDIÇÃO DE POSTO', `Posto ${propData.name} editado.`, editingProperty.id, 'property')
+          .catch((logErr) => console.warn('Falha ao registrar auditoria (edição de posto):', logErr));
       } else {
         const docRef = await addDoc(collection(db, 'properties'), propData);
-        await logAdminAction(profile, 'CRIAÇÃO DE POSTO', `Posto ${propData.name} criado.`, docRef.id, 'property');
+        setShowPropertyModal(false);
+        setEditingProperty(null);
+        void logAdminAction(profile, 'CRIAÇÃO DE POSTO', `Posto ${propData.name} criado.`, docRef.id, 'property')
+          .catch((logErr) => console.warn('Falha ao registrar auditoria (criação de posto):', logErr));
       }
-      setShowPropertyModal(false);
-      setEditingProperty(null);
     } catch (err) {
       console.error(err);
       alert('Erro ao salvar posto');
@@ -173,78 +369,252 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
   };
 
   const handleDeleteProperty = async (prop: PublicProperty) => {
-    if (!window.confirm(`Tem certeza que deseja excluir o posto ${prop.name}?`)) return;
+    // Agora "excluir" é Lixeira (soft delete). Purge é separado.
+    if (!window.confirm(`Mover o posto "${prop.name}" para a Lixeira?`)) return;
     try {
-      await deleteDoc(doc(db, 'properties', prop.id));
-      await logAdminAction(profile, 'EXCLUSÃO DE POSTO', `Posto ${prop.name} excluído.`, prop.id, 'property');
+      await updateDoc(doc(db, 'properties', prop.id), {
+        deletedAt: new Date().toISOString(),
+        deletedBy: profile.uid,
+      });
+      await logAdminAction(profile, 'LIXEIRA (POSTO)', `Posto ${prop.name} movido para a Lixeira.`, prop.id, 'property');
     } catch (err) {
       console.error(err);
-      alert('Erro ao excluir posto');
+      alert('Erro ao mover posto para lixeira');
     }
   };
 
-  const handleSaveUser = async (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    const formData = new FormData(e.currentTarget);
-    const userData = {
-      name: formData.get('name') as string,
-      registration: formData.get('registration') as string,
-      role: formData.get('role') as UserRole,
-      status: formData.get('status') as UserStatus,
-      email: formData.get('email') as string,
-    };
-
+  const handleRestoreProperty = async (prop: PublicProperty) => {
+    if (!window.confirm(`Restaurar o posto "${prop.name}" da Lixeira?`)) return;
     try {
-      if (editingUser) {
-        await updateDoc(doc(db, 'users', editingUser.uid), userData);
-        await logAdminAction(profile, 'EDIÇÃO DE USUÁRIO', `Usuário ${userData.name} editado.`, editingUser.uid, 'user');
-      } else {
-        // For new users created by admin, we might need to handle auth creation too, 
-        // but for now we'll just create the profile. 
-        // In a real app, this would trigger a cloud function or similar.
-        const newUid = `manual_${Date.now()}`;
-        await setDoc(doc(db, 'users', newUid), { ...userData, uid: newUid, createdAt: new Date().toISOString() });
-        await logAdminAction(profile, 'CRIAÇÃO DE USUÁRIO', `Usuário ${userData.name} criado manualmente.`, newUid, 'user');
-      }
-      setShowUserModal(false);
-      setEditingUser(null);
+      await updateDoc(doc(db, 'properties', prop.id), { deletedAt: null, deletedBy: null });
+      await logAdminAction(profile, 'RESTAURAR (POSTO)', `Posto ${prop.name} restaurado da Lixeira.`, prop.id, 'property');
     } catch (err) {
       console.error(err);
-      alert('Erro ao salvar usuário');
+      alert('Erro ao restaurar posto');
+    }
+  };
+
+  const handlePurgeProperty = async (prop: PublicProperty) => {
+    if (!window.confirm(`Excluir DEFINITIVAMENTE o posto "${prop.name}"? Esta ação não pode ser desfeita.`)) return;
+    try {
+      await deleteDoc(doc(db, 'properties', prop.id));
+      await logAdminAction(profile, 'PURGE (POSTO)', `Posto ${prop.name} excluído definitivamente.`, prop.id, 'property');
+    } catch (err) {
+      console.error(err);
+      alert('Erro ao excluir definitivamente');
+    }
+  };
+
+  const togglePropertySelection = (id: string, checked: boolean) => {
+    setSelectedPropertyIds((prev) => {
+      const next = new Set(prev);
+      if (checked) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  };
+
+  const clearPropertySelection = () => setSelectedPropertyIds(new Set());
+
+  const selectAllVisibleProperties = () => {
+    setSelectedPropertyIds(new Set(visibleProperties.map((p) => p.id)));
+  };
+
+  const bulkTrashProperties = async (ids: string[], label: string) => {
+    if (ids.length === 0) return;
+    if (!window.confirm(`Mover ${label} para a Lixeira?`)) return;
+    try {
+      await Promise.all(
+        ids.map((id) =>
+          updateDoc(doc(db, 'properties', id), { deletedAt: new Date().toISOString(), deletedBy: profile.uid }),
+        ),
+      );
+      void logAdminAction(profile, 'LIXEIRA (POSTO) EM MASSA', `${ids.length} posto(s) movido(s) para a Lixeira.`, undefined, 'property');
+      clearPropertySelection();
+    } catch (err) {
+      console.error(err);
+      alert('Erro ao mover itens para a lixeira');
+    }
+  };
+
+  const bulkRestoreProperties = async (ids: string[], label: string) => {
+    if (ids.length === 0) return;
+    if (!window.confirm(`Restaurar ${label} da Lixeira?`)) return;
+    try {
+      await Promise.all(ids.map((id) => updateDoc(doc(db, 'properties', id), { deletedAt: null, deletedBy: null })));
+      void logAdminAction(profile, 'RESTAURAR (POSTO) EM MASSA', `${ids.length} posto(s) restaurado(s) da Lixeira.`, undefined, 'property');
+      clearPropertySelection();
+    } catch (err) {
+      console.error(err);
+      alert('Erro ao restaurar itens');
+    }
+  };
+
+  const bulkPurgeProperties = async (ids: string[], label: string) => {
+    if (ids.length === 0) return;
+    if (!window.confirm(`Excluir DEFINITIVAMENTE ${label}? Esta ação não pode ser desfeita.`)) return;
+    try {
+      await Promise.all(ids.map((id) => deleteDoc(doc(db, 'properties', id))));
+      void logAdminAction(profile, 'PURGE (POSTO) EM MASSA', `${ids.length} posto(s) excluído(s) definitivamente.`, undefined, 'property');
+      clearPropertySelection();
+    } catch (err) {
+      console.error(err);
+      alert('Erro ao excluir definitivamente (massa)');
     }
   };
 
   useEffect(() => {
-    setLoading(true);
-    const unsubUsers = onSnapshot(collection(db, 'users'), (snap) => {
-      setUsers(snap.docs.map(d => ({ ...d.data() as UserProfile, uid: d.id })));
-    });
-    const unsubProperties = onSnapshot(collection(db, 'properties'), (snap) => {
-      setProperties(snap.docs.map(d => ({ ...d.data() as PublicProperty, id: d.id })));
-    });
-    const unsubVehicles = onSnapshot(collection(db, 'vehicles'), (snap) => {
-      setVehicles(snap.docs.map(d => ({ ...d.data() as Vehicle, id: d.id })));
-    });
-    const unsubTeams = onSnapshot(collection(db, 'teams'), (snap) => {
-      setTeams(snap.docs.map(d => ({ ...d.data() as Team, id: d.id })));
-    });
-    const unsubLogs = onSnapshot(query(collection(db, 'audit_logs'), orderBy('timestamp', 'desc'), limit(100)), (snap) => {
-      setLogs(snap.docs.map(d => ({ ...d.data() as AuditLog, id: d.id })));
-      setLoading(false);
+    let unsubUsers: (() => void) | null = null;
+    let unsubPending: (() => void) | null = null;
+    let unsubProperties: (() => void) | null = null;
+    let unsubVehicles: (() => void) | null = null;
+    let unsubTeams: (() => void) | null = null;
+    let unsubLogs: (() => void) | null = null;
+    let interval: any = null;
+
+    const cleanup = () => {
+      try { unsubUsers?.(); } catch {}
+      try { unsubPending?.(); } catch {}
+      try { unsubProperties?.(); } catch {}
+      try { unsubVehicles?.(); } catch {}
+      try { unsubTeams?.(); } catch {}
+      try { unsubLogs?.(); } catch {}
+      unsubUsers = unsubPending = unsubProperties = unsubVehicles = unsubTeams = unsubLogs = null;
+      if (interval) clearInterval(interval);
+      interval = null;
+    };
+
+    const setup = async () => {
+      setLoading(true);
+      setAuthWarning(null);
+
+      unsubUsers = onSnapshot(collection(db, 'users'), (snap) => {
+        setUsers(snap.docs.map(d => ({ ...d.data() as UserProfile, uid: d.id })));
+        setLoading(false);
+      }, (err) => {
+        console.error('Erro ao ler usuários (Firestore):', err);
+        setLoading(false);
+        alert('Admin: não foi possível carregar usuários (permissão/rede).');
+      });
+
+      // Dedicated real-time pending list + counter
+      unsubPending = onSnapshot(
+        query(collection(db, 'users'), where('status', '==', 'PENDENTE')),
+        (snap) => {
+          setPendingCount(snap.size);
+          setPendingFsUsers(snap.docs.map(d => ({ ...d.data() as UserProfile, uid: d.id })));
+        },
+        (err) => console.warn('Falha ao consultar pendentes (Firestore):', err),
+      );
+
+      unsubProperties = onSnapshot(collection(db, 'properties'), (snap) => {
+        setProperties(snap.docs.map(d => ({ ...d.data() as PublicProperty, id: d.id })));
+      });
+      unsubVehicles = onSnapshot(collection(db, 'vehicles'), (snap) => {
+        setVehicles(snap.docs.map(d => ({ ...d.data() as Vehicle, id: d.id })));
+      });
+      unsubTeams = onSnapshot(collection(db, 'teams'), (snap) => {
+        setTeams(snap.docs.map(d => ({ ...d.data() as Team, id: d.id })));
+      });
+      unsubLogs = onSnapshot(
+        query(collection(db, 'audit_logs'), orderBy('timestamp', 'desc'), limit(100)),
+        (snap) => setLogs(snap.docs.map(d => ({ ...d.data() as AuditLog, id: d.id }))),
+        (err) => console.warn('Falha ao ler audit_logs (ok se regras bloquearem):', err),
+      );
+
+      const fetchPendingFromApi = async () => {
+        try {
+          setPendingApiError(null);
+          const idToken = await auth.currentUser?.getIdToken();
+          if (!idToken) return;
+          const tryFetch = async (url: string) => {
+            const res = await fetch(url, { headers: { Authorization: `Bearer ${idToken}` } });
+            const data = await res.json().catch(() => ({}));
+            return { res, data };
+          };
+
+          let { res, data } = await tryFetch('/admin/pending-users');
+          if (!res.ok) {
+            ({ res, data } = await tryFetch('/api/admin/pending-users'));
+          }
+          if (!res.ok) {
+            const details = data?.details
+              ? ` ${JSON.stringify(data.details)}`
+              : '';
+            setPendingApiError((data?.error || 'Falha ao buscar pendentes (API).') + details);
+            return;
+          }
+
+          const apiUsers = Array.isArray(data?.users) ? (data.users as any[]) : [];
+          setPendingApiUsers(
+            apiUsers.map((u) => ({
+              uid: u.uid || u.id,
+              name: u.name || '',
+              registration: u.registration || '',
+              role: (u.role || 'agent') as any,
+              status: (u.status || 'PENDENTE') as any,
+              email: u.email || '',
+              photoUrl: u.photoUrl,
+              photoVersion: u.photoVersion,
+              biometricEnabled: u.biometricEnabled,
+              failedAttempts: u.failedAttempts,
+              lockedUntil: u.lockedUntil,
+              createdAt: u.createdAt || new Date().toISOString(),
+            })),
+          );
+
+          if (process.env.NODE_ENV !== 'production') {
+            console.log('[admin] pendentes:', apiUsers.length);
+          }
+        } catch (e) {
+          setPendingApiError(e instanceof Error ? e.message : String(e));
+        }
+      };
+
+      void fetchPendingFromApi();
+      interval = setInterval(fetchPendingFromApi, 5_000);
+    };
+
+    // Wait for Firebase Auth to be ready, otherwise auth.currentUser may be null on first render.
+    const unsubAuth = onAuthStateChanged(auth, (u) => {
+      cleanup();
+      if (!u) {
+        setAuthWarning(
+          'Para aprovar usuários, faça login como ADMIN usando e-mail/senha ou Google (Firebase Auth). ' +
+            'Login biométrico não cria sessão do Firestore neste navegador.',
+        );
+        setLoading(false);
+        return;
+      }
+      void setup();
     });
 
     return () => {
-      unsubUsers();
-      unsubProperties();
-      unsubVehicles();
-      unsubTeams();
-      unsubLogs();
+      try { unsubAuth(); } catch {}
+      cleanup();
     };
   }, []);
 
   const handleUserStatus = async (user: UserProfile, newStatus: UserStatus) => {
     try {
-      await updateDoc(doc(db, 'users', user.uid), { status: newStatus });
+      const idToken = await auth.currentUser?.getIdToken();
+      if (!idToken) {
+        alert('Sessão inválida. Faça login novamente.');
+        return;
+      }
+      const res = await apiFetch(`/api/admin/users/${encodeURIComponent(user.uid)}/status`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ status: newStatus }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data?.error || 'Erro ao atualizar status');
+        return;
+      }
       await logAdminAction(profile, 'ALTERAÇÃO DE STATUS', `Usuário ${user.name} alterado para ${newStatus}`, user.uid, 'user');
     } catch (err) {
       console.error(err);
@@ -254,7 +624,24 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
 
   const handleUserRole = async (user: UserProfile, newRole: UserRole) => {
     try {
-      await updateDoc(doc(db, 'users', user.uid), { role: newRole });
+      const idToken = await auth.currentUser?.getIdToken();
+      if (!idToken) {
+        alert('Sessão inválida. Faça login novamente.');
+        return;
+      }
+      const res = await apiFetch(`/api/admin/users/${encodeURIComponent(user.uid)}/role`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({ role: newRole }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data?.error || 'Erro ao atualizar perfil');
+        return;
+      }
       await logAdminAction(profile, 'ALTERAÇÃO DE PERFIL', `Usuário ${user.name} alterado para ${newRole}`, user.uid, 'user');
     } catch (err) {
       console.error(err);
@@ -265,7 +652,22 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
   const handleDeleteUser = async (user: UserProfile) => {
     if (!window.confirm(`Tem certeza que deseja excluir o usuário ${user.name}?`)) return;
     try {
-      await deleteDoc(doc(db, 'users', user.uid));
+      const idToken = await auth.currentUser?.getIdToken();
+      if (!idToken) {
+        alert('Sessão inválida. Faça login novamente.');
+        return;
+      }
+      const res = await apiFetch(`/api/admin/users/${encodeURIComponent(user.uid)}`, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${idToken}`,
+        },
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data?.error || 'Erro ao excluir usuário');
+        return;
+      }
       await logAdminAction(profile, 'EXCLUSÃO DE USUÁRIO', `Usuário ${user.name} excluído do sistema.`, user.uid, 'user');
     } catch (err) {
       console.error(err);
@@ -273,23 +675,46 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
     }
   };
 
-  const filteredUsers = users.filter(u => {
-    const matchesSearch = u.name.toLowerCase().includes(searchTerm.toLowerCase()) || 
-                         u.registration.toLowerCase().includes(searchTerm.toLowerCase()) ||
-                         u.email.toLowerCase().includes(searchTerm.toLowerCase());
+  const filteredUsers = users
+    .slice()
+    .sort((a, b) => {
+      const ta = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const tb = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      return tb - ta;
+    })
+    .filter(u => {
+    const q = (searchTerm || '').toLowerCase();
+    const name = (u.name || '').toString().toLowerCase();
+    const reg = (u.registration || '').toString().toLowerCase();
+    const email = (u.email || '').toString().toLowerCase();
+    const matchesSearch = name.includes(q) || reg.includes(q) || email.includes(q);
     const matchesStatus = filterStatus === 'ALL' || u.status === filterStatus;
     return matchesSearch && matchesStatus;
   });
 
+  const pendingUsersView = (() => {
+    const byUid = new Map<string, UserProfile>();
+    // Prefer dedicated Firestore query for pending (more reliable than filtering the full list)
+    for (const u of pendingFsUsers) byUid.set(u.uid, u);
+    // Still include any pending that came through the full snapshot (defensive)
+    for (const u of filteredUsers.filter((u) => u.status === 'PENDENTE')) byUid.set(u.uid, u);
+    for (const u of pendingApiUsers) byUid.set(u.uid, u);
+    return Array.from(byUid.values()).sort((a, b) => {
+      const ta = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const tb = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      return tb - ta;
+    });
+  })();
+
   return (
-    <div className="fixed inset-0 z-[2000] bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+    <div className="fixed inset-0 z-[2000] bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-2 sm:p-4 overflow-y-auto">
       <motion.div 
         initial={{ opacity: 0, scale: 0.95 }}
         animate={{ opacity: 1, scale: 1 }}
-        className="bg-slate-900 w-full max-w-6xl h-[90vh] rounded-3xl shadow-2xl border border-slate-800 flex flex-col overflow-hidden"
+        className="bg-slate-900 w-full max-w-6xl h-[95vh] sm:h-[90vh] rounded-2xl sm:rounded-3xl shadow-2xl border border-slate-800 flex flex-col overflow-hidden"
       >
         {/* Header */}
-        <div className="p-6 border-b border-slate-800 flex items-center justify-between bg-slate-900/50">
+        <div className="p-4 sm:p-6 border-b border-slate-800 flex items-center justify-between bg-slate-900/50">
           <div className="flex items-center gap-3">
             <div className="p-2 bg-amber-500/20 rounded-xl">
               <Shield className="w-6 h-6 text-amber-500" />
@@ -314,12 +739,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
             { id: 'properties', label: 'Postos/Próprios', icon: MapPin },
             { id: 'vehicles', label: 'Viaturas', icon: Truck },
             { id: 'teams', label: 'Equipes', icon: Users },
+            { id: 'reports', label: 'Relatórios', icon: FileText },
             { id: 'logs', label: 'Auditoria', icon: History },
           ].map((tab) => (
             <button
               key={tab.id}
               onClick={() => setActiveTab(tab.id as any)}
-              className={`flex items-center gap-2 px-6 py-4 text-sm font-bold transition-all border-b-2 whitespace-nowrap ${
+              className={`relative flex items-center gap-2 px-6 py-4 text-sm font-bold transition-all border-b-2 whitespace-nowrap ${
                 activeTab === tab.id 
                   ? 'text-amber-500 border-amber-500 bg-amber-500/5' 
                   : 'text-slate-400 border-transparent hover:text-slate-200 hover:bg-slate-800/50'
@@ -327,12 +753,36 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
             >
               <tab.icon className="w-4 h-4" />
               {tab.label}
+              {tab.id === 'reports' && hasUnreadReports && (
+                <span
+                  className="absolute top-2 right-2 w-4 h-4 rounded-full bg-red-600 text-white flex items-center justify-center shadow-lg pointer-events-none"
+                  title="Novos relatórios"
+                >
+                  <Bell className="w-2.5 h-2.5" />
+                </span>
+              )}
             </button>
           ))}
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto p-6 bg-slate-900/50">
+        <div className="flex-1 overflow-y-auto p-3 sm:p-6 bg-slate-900/50">
+          {isLocalhost && isVitePreviewPort && (
+            <div className="mb-4 bg-red-500/10 border border-red-500/30 text-red-200 rounded-2xl p-4 text-sm">
+              <p className="font-bold mb-1">Backend não disponível neste preview</p>
+              <p className="text-xs text-red-200/80 leading-relaxed">
+                Você está em <span className="font-mono">{window.location.host}</span> (Vite preview). Aqui as rotas{' '}
+                <span className="font-mono">/api/*</span> não rodam, então criar/aprovar usuários pode falhar.
+                Abra pelo servidor completo em <span className="font-mono">http://127.0.0.1:3000</span>.
+              </p>
+            </div>
+          )}
+          {authWarning && (
+            <div className="mb-4 bg-amber-500/10 border border-amber-500/30 text-amber-200 rounded-2xl p-4 text-sm">
+              <p className="font-bold mb-1">Sessão de admin não detectada</p>
+              <p className="text-xs text-amber-200/80 leading-relaxed">{authWarning}</p>
+            </div>
+          )}
           {activeTab === 'users' && (
             <div className="space-y-6">
               <div className="flex flex-col md:flex-row gap-4 items-center justify-between">
@@ -354,27 +804,39 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                     onChange={(e) => setFilterStatus(e.target.value as any)}
                   >
                     <option value="ALL">Todos os Status</option>
-                    <option value="PENDENTE">Pendentes</option>
+                    <option value="PENDENTE">Pendentes ({Math.max(pendingCount, pendingApiUsers.length)})</option>
                     <option value="ATIVO">Ativos</option>
                     <option value="BLOQUEADO">Bloqueados</option>
+                    <option value="DESATIVADO">Desativados</option>
                   </select>
-                  <button 
-                    onClick={() => { setEditingUser(null); setShowUserModal(true); }}
-                    className="flex items-center gap-2 px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white text-sm font-bold rounded-xl transition-colors ml-2"
-                  >
-                    <Plus className="w-4 h-4" />
-                    Novo Usuário
-                  </button>
                 </div>
               </div>
 
               <div className="grid gap-4">
-                {filteredUsers.map((user) => (
-                  <motion.div 
-                    layout
-                    key={user.uid}
-                    className="bg-slate-800/50 border border-slate-700 rounded-2xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-4 hover:border-slate-600 transition-colors"
-                  >
+                {filterStatus === 'PENDENTE' && pendingApiError && (
+                  <div className="bg-red-500/10 border border-red-500/30 text-red-200 rounded-2xl p-4 text-sm">
+                    <p className="font-bold mb-1">Falha ao sincronizar pendentes (API)</p>
+                    <p className="text-xs text-red-200/80 leading-relaxed">{pendingApiError}</p>
+                  </div>
+                )}
+
+                {((filterStatus === 'PENDENTE' ? pendingUsersView : filteredUsers).length === 0) && (
+                  <div className="bg-slate-800/30 border border-slate-700 rounded-2xl p-6 text-slate-300">
+                    <p className="font-bold text-white mb-1">Nenhum usuário encontrado</p>
+                    <p className="text-sm text-slate-400">
+                      Se alguém acabou de se cadastrar, confirme que o ADMIN está logado via Firebase Auth e que o usuário criou o perfil no Firestore com status <span className="font-mono">PENDENTE</span>.
+                    </p>
+                  </div>
+                )}
+                {(filterStatus === 'PENDENTE' ? pendingUsersView : filteredUsers).map((user) => {
+                  const isMaster = (user.email || '').toLowerCase() === SUPER_ADMIN_EMAIL.toLowerCase();
+
+                  return (
+                    <motion.div 
+                      layout
+                      key={user.uid}
+                      className="bg-slate-800/50 border border-slate-700 rounded-2xl p-4 flex flex-col md:flex-row md:items-center justify-between gap-4 hover:border-slate-600 transition-colors"
+                    >
                     <div className="flex items-center gap-4">
                       <div className="w-12 h-12 rounded-full bg-slate-700 overflow-hidden flex-shrink-0">
                         {user.photoUrl ? (
@@ -388,6 +850,11 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                       <div>
                         <div className="flex items-center gap-2">
                           <h3 className="font-bold text-white">{user.name}</h3>
+                          {isMaster && (
+                            <span className="text-[10px] px-2 py-0.5 rounded-full font-black uppercase bg-indigo-500/20 text-indigo-300">
+                              MASTER
+                            </span>
+                          )}
                           <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold uppercase ${
                             user.status === 'ATIVO' ? 'bg-emerald-500/20 text-emerald-400' :
                             user.status === 'PENDENTE' ? 'bg-amber-500/20 text-amber-400' :
@@ -401,21 +868,43 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-2 flex-wrap">
+                    <div className="flex items-center gap-2 flex-nowrap max-w-full overflow-x-auto no-scrollbar">
                       {user.status === 'PENDENTE' && (
-                        <button 
-                          onClick={() => handleUserStatus(user, 'ATIVO')}
-                          className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-lg transition-colors"
-                        >
-                          <CheckCircle2 className="w-3.5 h-3.5" />
-                          Aprovar
-                        </button>
+                        <>
+                          <button 
+                            onClick={() => handleUserStatus(user, 'ATIVO')}
+                            className="flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold rounded-lg transition-colors shrink-0 disabled:opacity-50 disabled:pointer-events-none"
+                            disabled={isMaster}
+                          >
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            Aprovar
+                          </button>
+                          <button
+                            onClick={() => handleUserStatus(user, 'BLOQUEADO')}
+                            className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-700 hover:bg-red-600 text-white text-xs font-bold rounded-lg transition-colors shrink-0 disabled:opacity-50 disabled:pointer-events-none"
+                            title="Bloqueia o acesso no Auth e no Firestore"
+                            disabled={isMaster}
+                          >
+                            <Lock className="w-3.5 h-3.5" />
+                            Bloquear
+                          </button>
+                          <button
+                            onClick={() => handleUserStatus(user, 'DESATIVADO')}
+                            className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-700 hover:bg-slate-600 text-white text-xs font-bold rounded-lg transition-colors shrink-0 disabled:opacity-50 disabled:pointer-events-none"
+                            title="Recusa a solicitação (desativa)"
+                            disabled={isMaster}
+                          >
+                            <XCircle className="w-3.5 h-3.5" />
+                            Recusar
+                          </button>
+                        </>
                       )}
                       
                       {user.status === 'ATIVO' ? (
                         <button 
                           onClick={() => handleUserStatus(user, 'BLOQUEADO')}
-                          className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-700 hover:bg-red-600 text-white text-xs font-bold rounded-lg transition-colors"
+                          className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-700 hover:bg-red-600 text-white text-xs font-bold rounded-lg transition-colors shrink-0 disabled:opacity-50 disabled:pointer-events-none"
+                          disabled={isMaster}
                         >
                           <Lock className="w-3.5 h-3.5" />
                           Bloquear
@@ -423,7 +912,8 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                       ) : user.status === 'BLOQUEADO' ? (
                         <button 
                           onClick={() => handleUserStatus(user, 'ATIVO')}
-                          className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-700 hover:bg-emerald-600 text-white text-xs font-bold rounded-lg transition-colors"
+                          className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-700 hover:bg-emerald-600 text-white text-xs font-bold rounded-lg transition-colors shrink-0 disabled:opacity-50 disabled:pointer-events-none"
+                          disabled={isMaster}
                         >
                           <Unlock className="w-3.5 h-3.5" />
                           Desbloquear
@@ -431,9 +921,10 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                       ) : null}
 
                       <select 
-                        className="bg-slate-700 border border-slate-600 rounded-lg px-2 py-1.5 text-xs text-white outline-none"
+                        className="bg-slate-700 border border-slate-600 rounded-lg px-2 py-1.5 text-xs text-white outline-none shrink-0 disabled:opacity-50 disabled:pointer-events-none"
                         value={user.role}
                         onChange={(e) => handleUserRole(user, e.target.value as UserRole)}
+                        disabled={isMaster}
                       >
                         <option value="agent">Agente</option>
                         <option value="supervisor">Supervisor</option>
@@ -441,21 +932,17 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                       </select>
 
                       <button 
-                        onClick={() => { setEditingUser(user); setShowUserModal(true); }}
-                        className="p-2 text-slate-400 hover:text-amber-400 hover:bg-amber-400/10 rounded-lg transition-colors"
-                      >
-                        <Edit2 className="w-4 h-4" />
-                      </button>
-
-                      <button 
                         onClick={() => handleDeleteUser(user)}
-                        className="p-2 text-slate-400 hover:text-red-400 hover:bg-red-400/10 rounded-lg transition-colors"
+                        className="p-2 text-red-400 hover:text-red-300 hover:bg-red-400/10 rounded-lg transition-colors shrink-0 disabled:opacity-50 disabled:pointer-events-none"
+                        title="Excluir usuário"
+                        disabled={isMaster || !isMasterAdmin}
                       >
                         <Trash2 className="w-4 h-4" />
                       </button>
                     </div>
                   </motion.div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}
@@ -469,8 +956,8 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                   Exportar CSV
                 </button>
               </div>
-              <div className="bg-slate-800/30 rounded-2xl border border-slate-800 overflow-hidden">
-                <table className="w-full text-left text-sm">
+              <div className="bg-slate-800/30 rounded-2xl border border-slate-800 overflow-hidden overflow-x-auto">
+                <table className="w-full min-w-[720px] text-left text-sm">
                   <thead className="bg-slate-800/50 text-slate-400 text-xs uppercase font-bold">
                     <tr>
                       <th className="px-4 py-3">Data/Hora</th>
@@ -495,12 +982,348 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                             {log.action}
                           </span>
                         </td>
-                        <td className="px-4 py-3 text-slate-400 text-xs">{log.details}</td>
+                        <td className="px-4 py-3 text-slate-400 text-xs break-words">{log.details}</td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
+            </div>
+          )}
+
+          {activeTab === 'reports' && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <h3 className="text-lg font-bold text-white">Relatórios de Plantão</h3>
+                  <div className="flex items-center bg-slate-800/40 border border-slate-700 rounded-xl p-1">
+                    <button
+                      type="button"
+                      onClick={() => setReportsView('active')}
+                      className={[
+                        'px-3 py-1.5 text-xs font-black rounded-lg transition-colors',
+                        reportsView === 'active' ? 'bg-amber-600 text-white' : 'text-slate-300 hover:text-white',
+                      ].join(' ')}
+                      title="Relatórios ativos"
+                    >
+                      Ativos
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setReportsView('trash')}
+                      className={[
+                        'px-3 py-1.5 text-xs font-black rounded-lg transition-colors',
+                        reportsView === 'trash' ? 'bg-red-600 text-white' : 'text-slate-300 hover:text-white',
+                      ].join(' ')}
+                      title="Lixeira"
+                    >
+                      Lixeira
+                    </button>
+                  </div>
+                </div>
+                <span className="text-xs text-slate-400 font-bold whitespace-nowrap">
+                  {reportsView === 'trash' ? 'Lixeira' : 'Ativos'}: {visibleReports.length} • Total: {Math.min(reports.length, 200)}
+                </span>
+              </div>
+
+              {visibleReports.length === 0 ? (
+                <div className="bg-slate-800/30 rounded-2xl border border-slate-800 p-8 text-center text-slate-400">
+                  {reportsView === 'trash'
+                    ? 'Nenhum relatório na lixeira.'
+                    : 'Nenhum relatório encontrado ainda.'}
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  {platoonOrder
+                    .map((p) => {
+                      const items = visibleReports.filter((r) => platoonFromTeamName(r.teamName) === p);
+                      return { p, items };
+                    })
+                    .filter(({ items }) => items.length > 0)
+                    .map(({ p, items }) => (
+                      <div key={p} className="space-y-3">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm font-black text-white tracking-widest">
+                              PELOTÃO {p}
+                            </span>
+                            {platoonShiftHint[p] && (
+                              <span className="text-[10px] font-black uppercase tracking-widest px-2 py-0.5 rounded-full bg-indigo-500/15 text-indigo-300">
+                                {platoonShiftHint[p]}
+                              </span>
+                            )}
+                          </div>
+                          <span className="text-xs text-slate-400 font-bold">
+                            {items.length} relatório(s)
+                          </span>
+                        </div>
+
+                        <div className="space-y-4">
+                          {groupByDayBy<ShiftReport>(
+                            items,
+                            (r: ShiftReport) => (r.deletedAt ? r.deletedAt : r.createdAt),
+                          ).map((group) => (
+                            <div key={`${p}-${group.key}`} className="space-y-2">
+                              <div className="flex items-center gap-2">
+                                <div className="h-px flex-1 bg-slate-800" />
+                                <span className="text-[11px] font-black uppercase tracking-widest text-slate-500">
+                                  {group.label}
+                                </span>
+                                <div className="h-px flex-1 bg-slate-800" />
+                              </div>
+
+                              <div className="grid gap-3">
+                                {group.items.map((r) => (
+                                  <div
+                                    key={r.id}
+                                    className="bg-slate-800/40 border border-slate-700 rounded-2xl p-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3"
+                                  >
+                                    <div className="min-w-0">
+                                      <div className="flex flex-wrap items-center gap-2">
+                                        <span className="text-white font-bold truncate">
+                                          {r.agentName}
+                                        </span>
+                                        <span className="text-[10px] font-black uppercase tracking-widest px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-300">
+                                          {r.shift}
+                                        </span>
+                                        {r.vehiclePrefix && (
+                                          <span className="text-[10px] font-black uppercase tracking-widest px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-300">
+                                            {r.vehiclePrefix}
+                                          </span>
+                                        )}
+                                      </div>
+                                      <p className="text-xs text-slate-400 mt-1">
+                                        {r.teamName ? `Equipe: ${r.teamName} • ` : ''}
+                                        {format(new Date(r.createdAt), 'dd/MM/yyyy HH:mm')}
+                                      </p>
+                                      <p className="text-[11px] text-slate-500 font-mono mt-1 break-all">
+                                        {r.filename}
+                                      </p>
+                                      <p className="text-[11px] text-slate-500 mt-1">
+                                        Período: {format(new Date(r.windowStart), 'dd/MM HH:mm')} – {format(new Date(r.windowEnd), 'dd/MM HH:mm')}
+                                      </p>
+                                    </div>
+
+                                    <div className="flex items-center gap-2 shrink-0">
+                                      <button
+                                        type="button"
+                                        disabled={!r.downloadUrl}
+                                        onClick={async () => {
+                                          if (!r.downloadUrl) return;
+                                          try {
+                                            const blob = await fetchReportPdfBlob(r.id);
+                                            if (Capacitor.isNativePlatform()) {
+                                              await sharePdfBlob(blob, r.filename, 'Relatório de Plantão');
+                                            } else {
+                                              downloadBlob(blob, r.filename);
+                                            }
+                                          } catch (e) {
+                                            console.error(e);
+                                            if (Capacitor.isNativePlatform() && isShareCanceledError(e)) return;
+                                            if (Capacitor.isNativePlatform() && isShareBusyError(e)) return;
+                                            const msg = e instanceof Error ? e.message : String(e);
+                                            const base = getApiBaseUrl();
+                                            const extra =
+                                              Capacitor.isNativePlatform() && msg.toLowerCase().includes('failed to fetch')
+                                                ? `\n\nDiagnóstico:\n- apiBaseUrl: ${base || '(null)'}\n- origin: ${window.location.origin}`
+                                                : '';
+                                            alert(`Não foi possível baixar o PDF.\n\nDetalhes: ${msg}${extra}`);
+                                          }
+                                        }}
+                                        className={[
+                                          'flex items-center gap-2 px-3 py-2 text-white text-xs font-bold rounded-xl transition-colors',
+                                          r.downloadUrl ? 'bg-amber-600 hover:bg-amber-500' : 'bg-slate-700/60 opacity-60 cursor-not-allowed',
+                                        ].join(' ')}
+                                        title={r.downloadUrl ? 'Baixar PDF' : 'Este relatório não possui arquivo para download'}
+                                      >
+                                        <Download className="w-4 h-4" />
+                                        Baixar
+                                      </button>
+
+                                      <button
+                                        type="button"
+                                        disabled={!r.downloadUrl}
+                                        onClick={async () => {
+                                          if (!r.downloadUrl) return;
+                                          try {
+                                            const blob = await fetchReportPdfBlob(r.id);
+                                            if (Capacitor.isNativePlatform()) {
+                                              // Em Android WebView, não há `window.print()` confiável. Compartilhar abre em apps que imprimem/visualizam PDF.
+                                              await sharePdfBlob(blob, r.filename, 'Imprimir/abrir relatório');
+                                            } else {
+                                              openBlobForPrint(blob, r.filename);
+                                            }
+                                          } catch (e) {
+                                            console.error(e);
+                                            if (Capacitor.isNativePlatform() && isShareCanceledError(e)) return;
+                                            if (Capacitor.isNativePlatform() && isShareBusyError(e)) return;
+                                            const msg = e instanceof Error ? e.message : String(e);
+                                            const base = getApiBaseUrl();
+                                            const extra =
+                                              Capacitor.isNativePlatform() && msg.toLowerCase().includes('failed to fetch')
+                                                ? `\n\nDiagnóstico:\n- apiBaseUrl: ${base || '(null)'}\n- origin: ${window.location.origin}`
+                                                : '';
+                                            alert(`Não foi possível abrir para impressão.\n\nDetalhes: ${msg}${extra}`);
+                                          }
+                                        }}
+                                        className={[
+                                          'flex items-center gap-2 px-3 py-2 text-white text-xs font-bold rounded-xl transition-colors',
+                                          r.downloadUrl ? 'bg-slate-700 hover:bg-slate-600' : 'bg-slate-700/60 opacity-60 cursor-not-allowed',
+                                        ].join(' ')}
+                                        title={r.downloadUrl ? 'Imprimir' : 'Este relatório não possui arquivo para impressão'}
+                                      >
+                                        <Printer className="w-4 h-4" />
+                                        Imprimir
+                                      </button>
+
+                                      <button
+                                        type="button"
+                                        disabled={!isMasterAdmin || !r.downloadUrl || sendingReportEmailIds.has(r.id)}
+                                        onClick={async () => {
+                                          if (!isMasterAdmin || !r.downloadUrl || sendingReportEmailIds.has(r.id)) return;
+                                          try {
+                                            markSendingEmail(r.id, true);
+                                            const u = auth.currentUser;
+                                            if (!u) throw new Error('Sessão expirada.');
+                                            const token = await u.getIdToken();
+                                            const resp = await apiFetch(`/api/shift-reports/send/${encodeURIComponent(r.id)}`, {
+                                              method: 'POST',
+                                              headers: { Authorization: `Bearer ${token}` },
+                                            });
+                                            if (!resp.ok) {
+                                              const data = await resp.json().catch(() => ({}));
+                                              throw new Error(data?.error || `Falha ao enviar (HTTP ${resp.status})`);
+                                            }
+                                            alert('E-mail enviado para o ADM MASTER.');
+                                          } catch (e) {
+                                            console.error(e);
+                                            if (Capacitor.isNativePlatform() && isShareCanceledError(e)) return;
+                                            if (Capacitor.isNativePlatform() && isShareBusyError(e)) return;
+                                            const msg = e instanceof Error ? e.message : String(e);
+                                            const base = getApiBaseUrl();
+                                            const extra =
+                                              Capacitor.isNativePlatform() && msg.toLowerCase().includes('failed to fetch')
+                                                ? `\n\nDiagnóstico:\n- apiBaseUrl: ${base || '(null)'}\n- origin: ${window.location.origin}`
+                                                : '';
+                                            alert(`Não foi possível enviar por e-mail.\n\nDetalhes: ${msg}${extra}`);
+                                          } finally {
+                                            markSendingEmail(r.id, false);
+                                          }
+                                        }}
+                                        className={[
+                                          'flex items-center gap-2 px-3 py-2 text-white text-xs font-bold rounded-xl transition-colors',
+                                          isMasterAdmin && r.downloadUrl && !sendingReportEmailIds.has(r.id)
+                                            ? 'bg-slate-700 hover:bg-slate-600'
+                                            : 'bg-slate-700/60 opacity-60 cursor-not-allowed',
+                                        ].join(' ')}
+                                        title={
+                                          !isMasterAdmin
+                                            ? 'Somente o ADM MASTER pode enviar por e-mail'
+                                            : r.downloadUrl
+                                              ? 'Enviar por e-mail (opcional)'
+                                              : 'Sem arquivo para anexar no e-mail'
+                                        }
+                                      >
+                                        <Download className="w-4 h-4" />
+                                        {sendingReportEmailIds.has(r.id) ? 'Enviando...' : 'Enviar e-mail'}
+                                      </button>
+
+                                      <button
+                                        type="button"
+                                        disabled={!isMasterAdmin}
+                                        onClick={async () => {
+                                          if (!isMasterAdmin) return;
+                                          if (reportsView === 'trash') {
+                                            if (!window.confirm('Excluir DEFINITIVAMENTE este relatório? Esta ação não pode ser desfeita.')) return;
+                                          } else {
+                                            if (!window.confirm('Mover este relatório para a Lixeira?')) return;
+                                          }
+                                          try {
+                                            const u = auth.currentUser;
+                                            if (!u) throw new Error('Sessão expirada.');
+                                            const token = await u.getIdToken();
+                                            const endpoint =
+                                              reportsView === 'trash'
+                                                ? `/api/shift-reports/purge/${encodeURIComponent(r.id)}`
+                                                : `/api/shift-reports/trash/${encodeURIComponent(r.id)}`;
+                                            const resp = await fetch(endpoint, {
+                                              method: reportsView === 'trash' ? 'DELETE' : 'POST',
+                                              headers: { Authorization: `Bearer ${token}` },
+                                            });
+                                            if (!resp.ok) {
+                                              const data = await resp.json().catch(() => ({}));
+                                              throw new Error(
+                                                data?.error ||
+                                                  `Falha ao ${reportsView === 'trash' ? 'excluir definitivamente' : 'mover para lixeira'} (HTTP ${resp.status})`,
+                                              );
+                                            }
+                                          } catch (e) {
+                                            console.error(e);
+                                            const msg = e instanceof Error ? e.message : String(e);
+                                            alert(`Não foi possível concluir a ação.\n\nDetalhes: ${msg}`);
+                                          }
+                                        }}
+                                        className={[
+                                          'inline-flex items-center justify-center h-10 w-10 rounded-xl transition-colors',
+                                          isMasterAdmin ? 'bg-red-600 hover:bg-red-500 text-white' : 'bg-red-600/40 text-white/70 opacity-60 cursor-not-allowed',
+                                        ].join(' ')}
+                                        title={
+                                          !isMasterAdmin
+                                            ? 'Somente o ADM MASTER pode excluir'
+                                            : reportsView === 'trash'
+                                              ? 'Excluir definitivamente'
+                                              : 'Mover para lixeira'
+                                        }
+                                      >
+                                        <Trash2 className="w-5 h-5" />
+                                      </button>
+
+                                      {reportsView === 'trash' && (
+                                        <button
+                                          type="button"
+                                          disabled={!isMasterAdmin}
+                                          onClick={async () => {
+                                            if (!isMasterAdmin) return;
+                                            if (!window.confirm('Restaurar este relatório da Lixeira?')) return;
+                                            try {
+                                              const u = auth.currentUser;
+                                              if (!u) throw new Error('Sessão expirada.');
+                                              const token = await u.getIdToken();
+                                              const resp = await apiFetch(`/api/shift-reports/restore/${encodeURIComponent(r.id)}`, {
+                                                method: 'POST',
+                                                headers: { Authorization: `Bearer ${token}` },
+                                              });
+                                              if (!resp.ok) {
+                                                const data = await resp.json().catch(() => ({}));
+                                                throw new Error(data?.error || `Falha ao restaurar (HTTP ${resp.status})`);
+                                              }
+                                            } catch (e) {
+                                              console.error(e);
+                                              const msg = e instanceof Error ? e.message : String(e);
+                                              alert(`Não foi possível restaurar.\n\nDetalhes: ${msg}`);
+                                            }
+                                          }}
+                                          className={[
+                                            'flex items-center gap-2 px-3 py-2 text-xs font-bold rounded-xl transition-colors',
+                                            isMasterAdmin ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-emerald-600/40 text-white/70 opacity-60 cursor-not-allowed',
+                                          ].join(' ')}
+                                          title={isMasterAdmin ? 'Restaurar da lixeira' : 'Somente o ADM MASTER pode restaurar'}
+                                        >
+                                          <Unlock className="w-4 h-4" />
+                                          Restaurar
+                                        </button>
+                                      )}
+                                    </div>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                </div>
+              )}
             </div>
           )}
 
@@ -517,19 +1340,151 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                     onChange={(e) => setSearchTerm(e.target.value)}
                   />
                 </div>
-                <button 
-                  onClick={() => { setEditingProperty(null); setShowPropertyModal(true); }}
-                  className="flex items-center gap-2 px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white text-sm font-bold rounded-xl transition-colors"
-                >
-                  <Plus className="w-4 h-4" />
-                  Novo Posto
-                </button>
+                <div className="flex items-center gap-3 w-full md:w-auto justify-between md:justify-end">
+                  <div className="inline-flex rounded-xl bg-slate-800 border border-slate-700 p-1">
+                    <button
+                      type="button"
+                      onClick={() => { setPropertiesView('active'); clearPropertySelection(); }}
+                      className={[
+                        'px-3 py-1.5 text-xs font-black rounded-lg transition-colors',
+                        propertiesView === 'active' ? 'bg-slate-900 text-white' : 'text-slate-300 hover:text-white',
+                      ].join(' ')}
+                    >
+                      Ativos
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => { setPropertiesView('trash'); clearPropertySelection(); }}
+                      className={[
+                        'px-3 py-1.5 text-xs font-black rounded-lg transition-colors',
+                        propertiesView === 'trash' ? 'bg-red-600 text-white' : 'text-slate-300 hover:text-white',
+                      ].join(' ')}
+                    >
+                      Lixeira
+                    </button>
+                  </div>
+
+                  <button 
+                    onClick={() => { setEditingProperty(null); setShowPropertyModal(true); }}
+                    className="flex items-center gap-2 px-4 py-2 bg-amber-600 hover:bg-amber-500 text-white text-sm font-bold rounded-xl transition-colors disabled:opacity-50 disabled:pointer-events-none"
+                    disabled={!isMasterAdmin || propertiesView === 'trash'}
+                    title={
+                      !isMasterAdmin
+                        ? 'Apenas o ADMIN MASTER pode criar/editar postos.'
+                        : propertiesView === 'trash'
+                          ? 'Restaure um posto antes de editar.'
+                          : undefined
+                    }
+                  >
+                    <Plus className="w-4 h-4" />
+                    Novo Posto
+                  </button>
+                </div>
+              </div>
+
+              <div className="bg-slate-800/40 border border-slate-700 rounded-2xl p-4 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                <div className="text-xs text-slate-300">
+                  <span className="font-black text-white">Postos/Próprios</span>
+                  <span className="text-slate-500"> • </span>
+                  <span className="text-slate-300">
+                    Ativos: <span className="font-black text-white">{activeProperties.length}</span>
+                    <span className="text-slate-500"> • </span>
+                    Lixeira: <span className="font-black text-white">{trashedProperties.length}</span>
+                  </span>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  {isMasterAdmin && (
+                    <label
+                      className={[
+                        'inline-flex items-center gap-2 px-3 py-2 text-xs font-black rounded-xl bg-slate-900/60 border border-slate-700 text-white select-none',
+                        visibleProperties.length === 0 ? 'opacity-60' : '',
+                      ].join(' ')}
+                      title="Marcar/desmarcar todos (visíveis)"
+                    >
+                      <input
+                        ref={selectAllRef}
+                        type="checkbox"
+                        className="w-4 h-4 accent-amber-500"
+                        disabled={visibleProperties.length === 0}
+                        checked={allVisiblePropertiesSelected}
+                        onChange={(e) => {
+                          if (e.target.checked) selectAllVisibleProperties();
+                          else clearPropertySelection();
+                        }}
+                        aria-label="Marcar todos os postos visíveis"
+                      />
+                      Marcar todos ({selectedPropertyIds.size})
+                    </label>
+                  )}
+
+                  {propertiesView === 'active' ? (
+                    <>
+                      <button
+                        type="button"
+                        className="px-3 py-2 text-xs font-black rounded-xl bg-red-600 text-white hover:bg-red-500 transition-colors disabled:opacity-50 disabled:pointer-events-none"
+                        disabled={!isMasterAdmin || selectedPropertyIds.size === 0}
+                        onClick={() => bulkTrashProperties(Array.from(selectedPropertyIds), `${selectedPropertyIds.size} selecionado(s)`)}
+                        title={!isMasterAdmin ? 'Somente ADM MASTER' : 'Mover selecionados para lixeira'}
+                      >
+                        <Trash2 className="w-4 h-4 inline-block -mt-0.5 mr-2" />
+                        Excluir selecionados
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        className="px-3 py-2 text-xs font-black rounded-xl bg-emerald-600 text-white hover:bg-emerald-500 transition-colors disabled:opacity-50 disabled:pointer-events-none"
+                        disabled={!isMasterAdmin || selectedPropertyIds.size === 0}
+                        onClick={() => bulkRestoreProperties(Array.from(selectedPropertyIds), `${selectedPropertyIds.size} selecionado(s)`)}
+                        title={!isMasterAdmin ? 'Somente ADM MASTER' : 'Restaurar selecionados'}
+                      >
+                        <Unlock className="w-4 h-4 inline-block -mt-0.5 mr-2" />
+                        Restaurar
+                      </button>
+                      <button
+                        type="button"
+                        className="px-3 py-2 text-xs font-black rounded-xl bg-red-700 text-white hover:bg-red-600 transition-colors disabled:opacity-50 disabled:pointer-events-none"
+                        disabled={!isMasterAdmin || selectedPropertyIds.size === 0}
+                        onClick={() => bulkPurgeProperties(Array.from(selectedPropertyIds), `${selectedPropertyIds.size} selecionado(s)`)}
+                        title={!isMasterAdmin ? 'Somente ADM MASTER' : 'Excluir definitivamente selecionados'}
+                      >
+                        <Trash2 className="w-4 h-4 inline-block -mt-0.5 mr-2" />
+                        Excluir definitivo
+                      </button>
+                      <button
+                        type="button"
+                        className="px-3 py-2 text-xs font-black rounded-xl bg-red-700/20 border border-red-600/40 text-red-200 hover:bg-red-700/30 transition-colors disabled:opacity-50 disabled:pointer-events-none"
+                        disabled={!isMasterAdmin || visibleProperties.length === 0}
+                        onClick={() => bulkPurgeProperties(visibleProperties.map((p) => p.id), 'TODOS os postos da Lixeira (visíveis)')}
+                        title={!isMasterAdmin ? 'Somente ADM MASTER' : 'Purge de todos visíveis na lixeira'}
+                      >
+                        <Trash2 className="w-4 h-4 inline-block -mt-0.5 mr-2" />
+                        Purge de todos
+                      </button>
+                    </>
+                  )}
+                </div>
               </div>
 
               <div className="grid gap-4">
-                {properties.filter(p => p.name.toLowerCase().includes(searchTerm.toLowerCase())).map((prop) => (
+                {visibleProperties
+                  .filter(p => (p.name || '').toLowerCase().includes(searchTerm.toLowerCase()))
+                  .map((prop) => (
                   <div key={prop.id} className="bg-slate-800/50 border border-slate-700 rounded-2xl p-4 flex items-center justify-between gap-4">
                     <div className="flex items-center gap-4">
+                      {isMasterAdmin && (
+                        <label className="flex items-center">
+                          <input
+                            type="checkbox"
+                            className="w-4 h-4 accent-amber-500"
+                            checked={selectedPropertyIds.has(prop.id)}
+                            onChange={(e) => togglePropertySelection(prop.id, e.target.checked)}
+                            aria-label={`Selecionar ${prop.name}`}
+                          />
+                        </label>
+                      )}
                       <div className="p-3 bg-blue-500/10 rounded-xl">
                         <MapPin className="w-6 h-6 text-blue-400" />
                       </div>
@@ -540,18 +1495,45 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                       </div>
                     </div>
                     <div className="flex items-center gap-2">
-                      <button 
-                        onClick={() => { setEditingProperty(prop); setShowPropertyModal(true); }}
-                        className="p-2 text-slate-400 hover:text-amber-400 hover:bg-amber-400/10 rounded-lg transition-colors"
-                      >
-                        <Edit2 className="w-4 h-4" />
-                      </button>
-                      <button 
-                        onClick={() => handleDeleteProperty(prop)}
-                        className="p-2 text-slate-400 hover:text-red-400 hover:bg-red-400/10 rounded-lg transition-colors"
-                      >
-                        <Trash2 className="w-4 h-4" />
-                      </button>
+                      {propertiesView === 'active' ? (
+                        <>
+                          <button 
+                            onClick={() => { setEditingProperty(prop); setShowPropertyModal(true); }}
+                            className="p-2 text-slate-400 hover:text-amber-400 hover:bg-amber-400/10 rounded-lg transition-colors disabled:opacity-50 disabled:pointer-events-none"
+                            disabled={!isMasterAdmin}
+                            title={!isMasterAdmin ? 'Apenas o ADMIN MASTER pode editar postos.' : 'Editar posto'}
+                          >
+                            <Edit2 className="w-4 h-4" />
+                          </button>
+                          <button 
+                            onClick={() => handleDeleteProperty(prop)}
+                            className="p-2 text-slate-400 hover:text-red-400 hover:bg-red-400/10 rounded-lg transition-colors disabled:opacity-50 disabled:pointer-events-none"
+                            disabled={!isMasterAdmin}
+                            title={!isMasterAdmin ? 'Apenas o ADMIN MASTER pode excluir postos.' : 'Mover para Lixeira'}
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </>
+                      ) : (
+                        <>
+                          <button
+                            onClick={() => handleRestoreProperty(prop)}
+                            className="p-2 text-slate-400 hover:text-emerald-400 hover:bg-emerald-400/10 rounded-lg transition-colors disabled:opacity-50 disabled:pointer-events-none"
+                            disabled={!isMasterAdmin}
+                            title={!isMasterAdmin ? 'Somente ADM MASTER' : 'Restaurar'}
+                          >
+                            <Unlock className="w-4 h-4" />
+                          </button>
+                          <button
+                            onClick={() => handlePurgeProperty(prop)}
+                            className="p-2 text-slate-400 hover:text-red-300 hover:bg-red-400/10 rounded-lg transition-colors disabled:opacity-50 disabled:pointer-events-none"
+                            disabled={!isMasterAdmin}
+                            title={!isMasterAdmin ? 'Somente ADM MASTER' : 'Excluir definitivamente'}
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -678,65 +1660,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
 
         {/* Modals */}
         <AnimatePresence>
-          {showUserModal && (
-            <div className="fixed inset-0 z-[2100] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
-              <motion.div 
-                initial={{ opacity: 0, scale: 0.95 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 0.95 }}
-                className="bg-slate-800 w-full max-w-md rounded-3xl shadow-2xl border border-slate-700 overflow-hidden"
-              >
-                <div className="p-6 border-b border-slate-700 flex items-center justify-between">
-                  <h3 className="text-lg font-bold text-white">{editingUser ? 'Editar Usuário' : 'Novo Usuário'}</h3>
-                  <button onClick={() => setShowUserModal(false)} className="text-slate-400 hover:text-white"><X className="w-5 h-5" /></button>
-                </div>
-                <form onSubmit={handleSaveUser} className="p-6 space-y-4">
-                  <div className="space-y-1.5">
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Nome Completo</label>
-                    <input name="name" defaultValue={editingUser?.name} required className="w-full px-4 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-white text-sm focus:ring-2 focus:ring-amber-500 outline-none" placeholder="Ex: João Silva" />
-                  </div>
-                  <div className="space-y-1.5">
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Matrícula (RE)</label>
-                    <input name="registration" defaultValue={editingUser?.registration} required className="w-full px-4 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-white text-sm focus:ring-2 focus:ring-amber-500 outline-none" placeholder="Ex: 12345" />
-                  </div>
-                  <div className="space-y-1.5">
-                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">E-mail</label>
-                    <input name="email" type="email" defaultValue={editingUser?.email} required className="w-full px-4 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-white text-sm focus:ring-2 focus:ring-amber-500 outline-none" placeholder="nome@gcm.gov.br" />
-                  </div>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="space-y-1.5">
-                      <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Perfil</label>
-                      <select name="role" defaultValue={editingUser?.role || 'agent'} className="w-full px-4 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-white text-sm focus:ring-2 focus:ring-amber-500 outline-none">
-                        <option value="agent">Agente</option>
-                        <option value="supervisor">Supervisor</option>
-                        <option value="admin">Administrador</option>
-                      </select>
-                    </div>
-                    <div className="space-y-1.5">
-                      <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Status</label>
-                      <select name="status" defaultValue={editingUser?.status || 'PENDENTE'} className="w-full px-4 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-white text-sm focus:ring-2 focus:ring-amber-500 outline-none">
-                        <option value="PENDENTE">Pendente</option>
-                        <option value="ATIVO">Ativo</option>
-                        <option value="BLOQUEADO">Bloqueado</option>
-                      </select>
-                    </div>
-                  </div>
-                  <div className="pt-4 flex gap-3">
-                    <button type="button" onClick={() => setShowUserModal(false)} className="flex-1 py-2.5 bg-slate-700 hover:bg-slate-600 text-white font-bold rounded-xl transition-colors">Cancelar</button>
-                    <button type="submit" className="flex-1 py-2.5 bg-amber-600 hover:bg-amber-500 text-white font-bold rounded-xl transition-colors">Salvar</button>
-                  </div>
-                </form>
-              </motion.div>
-            </div>
-          )}
-
           {showPropertyModal && (
             <div className="fixed inset-0 z-[2100] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
               <motion.div 
                 initial={{ opacity: 0, scale: 0.95 }}
                 animate={{ opacity: 1, scale: 1 }}
                 exit={{ opacity: 0, scale: 0.95 }}
-                className="bg-slate-800 w-full max-w-md rounded-3xl shadow-2xl border border-slate-700 overflow-hidden"
+                className="bg-slate-800 w-full max-w-md rounded-2xl sm:rounded-3xl shadow-2xl border border-slate-700 overflow-hidden max-h-[90vh] overflow-y-auto"
               >
                 <div className="p-6 border-b border-slate-700 flex items-center justify-between">
                   <h3 className="text-lg font-bold text-white">{editingProperty ? 'Editar Posto' : 'Novo Posto'}</h3>
@@ -790,7 +1720,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                 initial={{ opacity: 0, scale: 0.95 }}
                 animate={{ opacity: 1, scale: 1 }}
                 exit={{ opacity: 0, scale: 0.95 }}
-                className="bg-slate-800 w-full max-w-md rounded-3xl shadow-2xl border border-slate-700 overflow-hidden"
+                className="bg-slate-800 w-full max-w-md rounded-2xl sm:rounded-3xl shadow-2xl border border-slate-700 overflow-hidden max-h-[90vh] overflow-y-auto"
               >
                 <div className="p-6 border-b border-slate-700 flex items-center justify-between">
                   <h3 className="text-lg font-bold text-white">{editingVehicle ? 'Editar Viatura' : 'Nova Viatura'}</h3>
@@ -843,7 +1773,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                 initial={{ opacity: 0, scale: 0.95 }}
                 animate={{ opacity: 1, scale: 1 }}
                 exit={{ opacity: 0, scale: 0.95 }}
-                className="bg-slate-800 w-full max-w-md rounded-3xl shadow-2xl border border-slate-700 overflow-hidden"
+                className="bg-slate-800 w-full max-w-md rounded-2xl sm:rounded-3xl shadow-2xl border border-slate-700 overflow-hidden max-h-[90vh] overflow-y-auto"
               >
                 <div className="p-6 border-b border-slate-700 flex items-center justify-between">
                   <h3 className="text-lg font-bold text-white">{editingTeam ? 'Editar Equipe' : 'Nova Equipe'}</h3>
@@ -857,10 +1787,10 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                   <div className="grid grid-cols-2 gap-4">
                     <div className="space-y-1.5">
                       <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Turno</label>
-                      <select name="shift" defaultValue={editingTeam?.shift || 'Manhã'} className="w-full px-4 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-white text-sm focus:ring-2 focus:ring-amber-500 outline-none">
-                        <option value="Manhã">Manhã</option>
-                        <option value="Tarde">Tarde</option>
-                        <option value="Noite">Noite</option>
+                      <select name="shift" defaultValue={editingTeam?.shift || 'Diurno'} className="w-full px-4 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-white text-sm focus:ring-2 focus:ring-amber-500 outline-none">
+                        <option value="Diurno">Diurno (06:00–18:00)</option>
+                        <option value="Intermediário">Intermediário (14:00–02:00)</option>
+                        <option value="Noturno">Noturno (18:00–06:00)</option>
                         <option value="12x36">12x36</option>
                       </select>
                     </div>

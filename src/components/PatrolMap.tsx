@@ -7,7 +7,7 @@ import {
   MapPin, AlertTriangle, Shield, Info, Navigation, Search, X, 
   Maximize2, Globe, Crosshair, Layers, ChevronLeft, ChevronRight, 
   ZoomIn, Plus, Minus, CheckCircle2, Clock, Users, PlayCircle,
-  TrendingUp, Activity, LayoutDashboard, Truck
+  TrendingUp, Activity, LayoutDashboard, CarFront, ChevronUp, ChevronDown
 } from 'lucide-react';
 import { PatrolRecord, OccurrenceRecord, PublicProperty, VehicleLocation, Geofence, OperationalAlert } from '../types';
 import { cn } from '../lib/utils';
@@ -88,7 +88,7 @@ const Button = ({
 };
 
 // GCM Institutional Icons
-const createGCMIcon = (status?: string) => {
+const createGCMIcon = (status?: string, visitCount: number = 0) => {
   const isVisited = status === 'visited';
   const isOccurrence = status === 'occurrence';
   
@@ -98,12 +98,20 @@ const createGCMIcon = (status?: string) => {
     '<path d="M20 6L9 17l-5-5" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>' : 
     '<path d="M12 8v4m0 4h.01" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>';
 
+  const countBadge =
+    visitCount > 1
+      ? `<div style="position:absolute; top:-6px; left:-6px; background:#f59e0b; color:white; border-radius:9999px; min-width:20px; height:20px; padding:0 6px; border:2px solid white; display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:900; box-shadow:0 2px 4px rgba(0,0,0,0.3); z-index:11;">
+           ${visitCount}
+         </div>`
+      : '';
+
   return L.divIcon({
     html: `<div class="relative" style="width: 42px; height: 48px;">
             <!-- Shield Shape -->
             <svg width="42" height="48" viewBox="0 0 24 24" fill="${shieldColor}" stroke="white" stroke-width="1.5" style="filter: drop-shadow(0 4px 6px rgba(0,0,0,0.4));">
               <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
             </svg>
+            ${countBadge}
             <!-- GCM Logo (Simplified) -->
             <div style="position: absolute; top: 12px; left: 11px; color: white; opacity: 0.9;">
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -191,6 +199,11 @@ export const PatrolMap: React.FC<PatrolMapProps> = ({
   onCenterVehicle,
   dark = false
 }) => {
+  const isMobile = useMemo(() => {
+    if (typeof window === 'undefined') return false;
+    return window.matchMedia?.('(max-width: 640px)')?.matches ?? false;
+  }, []);
+
   const [filter, setFilter] = useState<'all' | 'visited' | 'not_visited' | 'in_service' | 'occurrence'>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [zoom, setZoom] = useState(14);
@@ -202,6 +215,8 @@ export const PatrolMap: React.FC<PatrolMapProps> = ({
   const [vehiclePath, setVehiclePath] = useState<[number, number][]>([]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [showScrollButtons, setShowScrollButtons] = useState(false);
+  const [isHudCollapsed, setIsHudCollapsed] = useState<boolean>(() => (typeof window === 'undefined' ? false : true));
+  const [isMapActionsOpen, setIsMapActionsOpen] = useState(false);
 
   // Component to sync zoom level
   const ZoomTracker = () => {
@@ -392,73 +407,94 @@ export const PatrolMap: React.FC<PatrolMapProps> = ({
     <div id="map-container" className={cn("w-full h-full relative overflow-hidden bg-slate-50", isFullScreen && "fixed inset-0 z-[9999]")}>
       
       {/* Strategic Indicators Panel - Moved to bottom for better visibility on mobile */}
-      <div className="absolute bottom-24 left-4 right-4 z-[800] max-w-4xl mx-auto">
-        <div className="bg-white/95 backdrop-blur-xl border border-white/20 shadow-2xl rounded-2xl p-2 flex items-center justify-between gap-2 overflow-x-auto scrollbar-hide">
-          <button 
-            onClick={() => handleFilterChange('all')}
-            className={cn(
-              "flex items-center gap-2 px-3 py-1.5 rounded-xl border transition-all active:scale-95 min-w-fit",
-              filter === 'all' ? "bg-blue-900 border-blue-900 shadow-lg shadow-blue-900/20" : "bg-blue-50/50 border-blue-100/50 hover:bg-blue-100/50"
-            )}
+      <div className={cn("absolute z-[800] max-w-4xl mx-auto", isMobile ? "bottom-20 left-2 right-2" : "bottom-24 left-4 right-4")}>
+        {isMobile && (
+          <button
+            type="button"
+            onClick={() => setIsHudCollapsed((v) => !v)}
+            className="mb-2 w-full bg-white/90 backdrop-blur-xl border border-white/20 shadow-xl rounded-2xl px-3 py-2 flex items-center justify-between"
+            title={isHudCollapsed ? 'Mostrar indicadores' : 'Ocultar indicadores'}
           >
-            <div className={cn("p-1.5 rounded-lg", filter === 'all' ? "bg-white text-blue-900" : "bg-blue-900 text-white")}>
-              <LayoutDashboard className="w-3.5 h-3.5" />
+            <div className="flex items-center gap-2">
+              <div className="px-2 py-1 rounded-xl bg-slate-900 text-white text-[11px] font-black">
+                {indicators.visited}/{indicators.total}
+              </div>
+              <div className="text-[11px] font-bold text-slate-600">
+                Cobertura: <span className="font-black text-slate-900">{indicators.coverage}%</span>
+              </div>
             </div>
-            <div className="text-left">
-              <p className={cn("text-[8px] font-bold uppercase tracking-wider", filter === 'all' ? "text-white/60" : "text-blue-900/40")}>Total</p>
-              <p className={cn("text-sm font-black leading-none", filter === 'all' ? "text-white" : "text-blue-900")}>{indicators.total}</p>
-            </div>
+            {isHudCollapsed ? <ChevronUp className="w-5 h-5 text-slate-700" /> : <ChevronDown className="w-5 h-5 text-slate-700" />}
           </button>
+        )}
 
-          <button 
-            onClick={() => handleFilterChange('visited')}
-            className={cn(
-              "flex items-center gap-2 px-3 py-1.5 rounded-xl border transition-all active:scale-95 min-w-fit",
-              filter === 'visited' ? "bg-green-600 border-green-600 shadow-lg shadow-green-600/20" : "bg-green-50/50 border-green-100/50 hover:bg-green-100/50"
-            )}
-          >
-            <div className={cn("p-1.5 rounded-lg", filter === 'visited' ? "bg-white text-green-600" : "bg-green-600 text-white")}>
-              <CheckCircle2 className="w-3.5 h-3.5" />
-            </div>
-            <div className="text-left">
-              <p className={cn("text-[8px] font-bold uppercase tracking-wider", filter === 'visited' ? "text-white/60" : "text-green-700/40")}>Visitados</p>
-              <p className={cn("text-sm font-black leading-none", filter === 'visited' ? "text-white" : "text-green-700")}>{indicators.visited}</p>
-            </div>
-          </button>
+        {(!isMobile || !isHudCollapsed) && (
+          <div className="bg-white/95 backdrop-blur-xl border border-white/20 shadow-2xl rounded-2xl p-2 flex items-center justify-between gap-2 overflow-x-auto scrollbar-hide">
+            <button 
+              onClick={() => handleFilterChange('all')}
+              className={cn(
+                "flex items-center gap-2 px-3 py-1.5 rounded-xl border transition-all active:scale-95 min-w-fit",
+                filter === 'all' ? "bg-blue-900 border-blue-900 shadow-lg shadow-blue-900/20" : "bg-blue-50/50 border-blue-100/50 hover:bg-blue-100/50"
+              )}
+            >
+              <div className={cn("p-1.5 rounded-lg", filter === 'all' ? "bg-white text-blue-900" : "bg-blue-900 text-white")}>
+                <LayoutDashboard className="w-3.5 h-3.5" />
+              </div>
+              <div className="text-left">
+                <p className={cn("text-[8px] font-bold uppercase tracking-wider", filter === 'all' ? "text-white/60" : "text-blue-900/40")}>Total</p>
+                <p className={cn("text-sm font-black leading-none", filter === 'all' ? "text-white" : "text-blue-900")}>{indicators.total}</p>
+              </div>
+            </button>
 
-          <button 
-            onClick={() => handleFilterChange('not_visited')}
-            className={cn(
-              "flex items-center gap-2 px-3 py-1.5 rounded-xl border transition-all active:scale-95 min-w-fit",
-              filter === 'not_visited' ? "bg-red-600 border-red-600 shadow-lg shadow-red-600/20" : "bg-red-50/50 border-red-100/50 hover:bg-red-100/50"
-            )}
-          >
-            <div className={cn("p-1.5 rounded-lg", filter === 'not_visited' ? "bg-white text-red-600" : "bg-red-600 text-white")}>
-              <Clock className="w-3.5 h-3.5" />
-            </div>
-            <div className="text-left">
-              <p className={cn("text-[8px] font-bold uppercase tracking-wider", filter === 'not_visited' ? "text-white/60" : "text-red-700/40")}>Pendentes</p>
-              <p className={cn("text-sm font-black leading-none", filter === 'not_visited' ? "text-white" : "text-red-700")}>{indicators.pending}</p>
-            </div>
-          </button>
+            <button 
+              onClick={() => handleFilterChange('visited')}
+              className={cn(
+                "flex items-center gap-2 px-3 py-1.5 rounded-xl border transition-all active:scale-95 min-w-fit",
+                filter === 'visited' ? "bg-green-600 border-green-600 shadow-lg shadow-green-600/20" : "bg-green-50/50 border-green-100/50 hover:bg-green-100/50"
+              )}
+            >
+              <div className={cn("p-1.5 rounded-lg", filter === 'visited' ? "bg-white text-green-600" : "bg-green-600 text-white")}>
+                <CheckCircle2 className="w-3.5 h-3.5" />
+              </div>
+              <div className="text-left">
+                <p className={cn("text-[8px] font-bold uppercase tracking-wider", filter === 'visited' ? "text-white/60" : "text-green-700/40")}>Visitados</p>
+                <p className={cn("text-sm font-black leading-none", filter === 'visited' ? "text-white" : "text-green-700")}>{indicators.visited}</p>
+              </div>
+            </button>
 
-          <button 
-            onClick={() => handleFilterChange('visited')}
-            className="flex items-center gap-3 px-4 py-1.5 bg-slate-900 text-white rounded-xl shadow-lg min-w-fit hover:bg-slate-800 transition-all active:scale-95"
-          >
-            <div className="flex flex-col items-end">
-              <p className="text-[8px] font-bold text-white/40 uppercase tracking-wider">Cobertura</p>
-              <p className="text-sm font-black leading-none">{indicators.coverage}%</p>
-            </div>
-            <div className="w-8 h-8 relative flex items-center justify-center">
-              <svg className="w-full h-full transform -rotate-90">
-                <circle cx="16" cy="16" r="14" stroke="currentColor" strokeWidth="3" fill="transparent" className="text-white/10" />
-                <circle cx="16" cy="16" r="14" stroke="currentColor" strokeWidth="3" fill="transparent" strokeDasharray={87.92} strokeDashoffset={87.92 * (1 - indicators.coverage / 100)} className="text-blue-400" />
-              </svg>
-              <TrendingUp className="absolute w-3 h-3 text-blue-400" />
-            </div>
-          </button>
-        </div>
+            <button 
+              onClick={() => handleFilterChange('not_visited')}
+              className={cn(
+                "flex items-center gap-2 px-3 py-1.5 rounded-xl border transition-all active:scale-95 min-w-fit",
+                filter === 'not_visited' ? "bg-red-600 border-red-600 shadow-lg shadow-red-600/20" : "bg-red-50/50 border-red-100/50 hover:bg-red-100/50"
+              )}
+            >
+              <div className={cn("p-1.5 rounded-lg", filter === 'not_visited' ? "bg-white text-red-600" : "bg-red-600 text-white")}>
+                <Clock className="w-3.5 h-3.5" />
+              </div>
+              <div className="text-left">
+                <p className={cn("text-[8px] font-bold uppercase tracking-wider", filter === 'not_visited' ? "text-white/60" : "text-red-700/40")}>Pendentes</p>
+                <p className={cn("text-sm font-black leading-none", filter === 'not_visited' ? "text-white" : "text-red-700")}>{indicators.pending}</p>
+              </div>
+            </button>
+
+            <button 
+              onClick={() => handleFilterChange('visited')}
+              className="flex items-center gap-3 px-4 py-1.5 bg-slate-900 text-white rounded-xl shadow-lg min-w-fit hover:bg-slate-800 transition-all active:scale-95"
+            >
+              <div className="flex flex-col items-end">
+                <p className="text-[8px] font-bold text-white/40 uppercase tracking-wider">Cobertura</p>
+                <p className="text-sm font-black leading-none">{indicators.coverage}%</p>
+              </div>
+              <div className="w-8 h-8 relative flex items-center justify-center">
+                <svg className="w-full h-full transform -rotate-90">
+                  <circle cx="16" cy="16" r="14" stroke="currentColor" strokeWidth="3" fill="transparent" className="text-white/10" />
+                  <circle cx="16" cy="16" r="14" stroke="currentColor" strokeWidth="3" fill="transparent" strokeDasharray={87.92} strokeDashoffset={87.92 * (1 - indicators.coverage / 100)} className="text-blue-400" />
+                </svg>
+                <TrendingUp className="absolute w-3 h-3 text-blue-400" />
+              </div>
+            </button>
+          </div>
+        )}
       </div>
 
       <MapContainer 
@@ -505,7 +541,7 @@ export const PatrolMap: React.FC<PatrolMapProps> = ({
                   loc.status === 'occurrence' ? "bg-red-600" : "bg-slate-600"
                 )}>
                   <div className="flex items-center gap-2">
-                    <Truck className="w-4 h-4" />
+                    <CarFront className="w-4 h-4" />
                     <span className="font-bold text-xs uppercase tracking-wider">{loc.vehiclePrefix}</span>
                   </div>
                   <Badge variant="outline" className="text-[10px] border-white/30 text-white">
@@ -577,12 +613,15 @@ export const PatrolMap: React.FC<PatrolMapProps> = ({
           {filteredProperties.map((prop) => {
             const status = getPropertyStatus(prop);
             const lastPatrol = patrols.find(p => p.propertyId === prop.id);
+            // Quantas vezes esse posto foi visitado (dentro do conjunto de patrulhas carregado no mapa).
+            // Regra do usuário: se passou mais de uma vez, mostrar o número (2, 3, 4...).
+            const visitCount = patrols.filter((p) => p.propertyId === prop.id).length;
 
             return (
               <Marker
                 key={`prop-${prop.id}`}
                 position={[prop.latitude, prop.longitude]}
-                icon={createGCMIcon(status)}
+                icon={createGCMIcon(status, visitCount)}
               >
                 <Popup className="gcm-popup">
                   <div className="w-64 p-0 overflow-hidden rounded-xl">
@@ -619,6 +658,12 @@ export const PatrolMap: React.FC<PatrolMapProps> = ({
                             {lastPatrol?.teamName || 'N/A'}
                           </p>
                         </div>
+                      </div>
+                      <div className="p-2 bg-gray-50 rounded-lg border border-gray-100">
+                        <p className="text-[9px] font-bold text-gray-400 uppercase">Visitas (total)</p>
+                        <p className="text-[11px] font-bold text-gray-700">
+                          {visitCount}
+                        </p>
                       </div>
 
                       {onStartPatrol && (
@@ -696,48 +741,65 @@ export const PatrolMap: React.FC<PatrolMapProps> = ({
       </div>
 
       {/* Floating Controls - Bottom Right Vertical */}
-      <div className="absolute bottom-8 right-8 flex flex-col gap-3 z-[800]">
-        <button 
-          onClick={handleLocateMe}
-          className="bg-white/95 backdrop-blur-xl p-4 rounded-2xl border border-white/20 shadow-2xl hover:bg-white transition-all group active:scale-90"
-          title="Minha Localização"
-        >
-          <Crosshair className="w-6 h-6 text-blue-900 group-hover:scale-110 transition-transform" />
-        </button>
-        
-        <div className="flex flex-col bg-white/95 backdrop-blur-xl rounded-2xl border border-white/20 shadow-2xl overflow-hidden">
-          <button 
-            onClick={() => mapInstance?.zoomIn()}
-            className="p-4 hover:bg-gray-50 text-blue-900 transition-colors border-b border-gray-100 flex items-center justify-center"
+      <div className={cn("absolute z-[850]", isMobile ? "bottom-24 right-3" : "bottom-8 right-8")}>
+        <div className="relative">
+          {isMapActionsOpen && (
+            <div className={cn(
+              "absolute right-0 mb-3 w-48 bg-white/95 backdrop-blur-xl border border-white/20 shadow-2xl rounded-2xl overflow-hidden",
+              isMobile ? "bottom-14" : "bottom-16"
+            )}>
+              <button
+                onClick={() => { setIsMapActionsOpen(false); handleLocateMe(); }}
+                className="w-full px-4 py-3 flex items-center justify-between text-sm font-bold text-slate-800 hover:bg-slate-50"
+              >
+                Minha localização
+                <Crosshair className="w-4 h-4 text-blue-900" />
+              </button>
+              <div className="h-px bg-slate-100" />
+              <button
+                onClick={() => mapInstance?.zoomIn()}
+                className="w-full px-4 py-3 flex items-center justify-between text-sm font-bold text-slate-800 hover:bg-slate-50"
+              >
+                Zoom +
+                <Plus className="w-4 h-4 text-blue-900" />
+              </button>
+              <button
+                onClick={() => mapInstance?.zoomOut()}
+                className="w-full px-4 py-3 flex items-center justify-between text-sm font-bold text-slate-800 hover:bg-slate-50"
+              >
+                Zoom -
+                <Minus className="w-4 h-4 text-blue-900" />
+              </button>
+              <div className="h-px bg-slate-100" />
+              <button
+                onClick={() => setMapType(mapType === 'street' ? 'satellite' : 'street')}
+                className="w-full px-4 py-3 flex items-center justify-between text-sm font-bold text-slate-800 hover:bg-slate-50"
+              >
+                {mapType === 'street' ? 'Satélite' : 'Mapa'}
+                <Globe className="w-4 h-4 text-blue-900" />
+              </button>
+              <button
+                onClick={() => { setIsMapActionsOpen(false); toggleFullScreen(); }}
+                className="w-full px-4 py-3 flex items-center justify-between text-sm font-bold text-slate-800 hover:bg-slate-50"
+              >
+                Tela cheia
+                <Maximize2 className="w-4 h-4 text-blue-900" />
+              </button>
+            </div>
+          )}
+
+          <button
+            type="button"
+            onClick={() => setIsMapActionsOpen((v) => !v)}
+            className={cn(
+              "bg-blue-900 text-white shadow-2xl rounded-2xl w-12 h-12 flex items-center justify-center active:scale-95 transition-transform",
+              isMapActionsOpen && "bg-slate-900"
+            )}
+            title="Ações do mapa"
           >
-            <Plus className="w-6 h-6" />
-          </button>
-          <button 
-            onClick={() => mapInstance?.zoomOut()}
-            className="p-4 hover:bg-gray-50 text-blue-900 transition-colors flex items-center justify-center"
-          >
-            <Minus className="w-6 h-6" />
+            <Layers className="w-6 h-6" />
           </button>
         </div>
-
-        <button 
-          onClick={() => setMapType(mapType === 'street' ? 'satellite' : 'street')}
-          className={cn(
-            "bg-white/95 backdrop-blur-xl p-4 rounded-2xl border border-white/20 shadow-2xl hover:bg-white transition-all group active:scale-90",
-            mapType === 'satellite' && "bg-blue-900 border-blue-800"
-          )}
-          title="Alternar Satélite"
-        >
-          <Globe className={cn("w-6 h-6 transition-transform", mapType === 'satellite' ? "text-white scale-110" : "text-blue-900 group-hover:scale-110")} />
-        </button>
-
-        <button 
-          onClick={toggleFullScreen}
-          className="bg-white/95 backdrop-blur-xl p-4 rounded-2xl border border-white/20 shadow-2xl hover:bg-white transition-all group active:scale-90"
-          title="Tela Cheia"
-        >
-          <Maximize2 className="w-6 h-6 text-blue-900 group-hover:scale-110 transition-transform" />
-        </button>
       </div>
 
       <style dangerouslySetInnerHTML={{ __html: `

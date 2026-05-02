@@ -51,6 +51,7 @@
     "express": "^4.21.2",
     "firebase": "^12.11.0",
     "firebase-admin": "^13.7.0",
+    "google-auth-library": "^10.6.2",
     "html2canvas": "^1.4.1",
     "html5-qrcode": "^2.3.8",
     "jsonwebtoken": "^9.0.3",

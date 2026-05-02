@@ -21,6 +21,7 @@ import { registerAdminUserRoutes } from "./server/routes/adminUsers";
 import { registerNotificationRoutes } from "./server/routes/notifications";
 import { registerRegistrationRoutes } from "./server/routes/registration";
 import { registerShiftReportRoutes } from "./server/routes/shiftReports";
+import { registerGoogleWebAuthRoutes } from "./server/routes/googleWebAuth";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -98,6 +99,7 @@ registerAdminUserRoutes(app);
 registerNotificationRoutes(app);
 registerRegistrationRoutes(app);
 registerShiftReportRoutes(app);
+registerGoogleWebAuthRoutes(app);
 
 // --- WebAuthn Routes ---
 

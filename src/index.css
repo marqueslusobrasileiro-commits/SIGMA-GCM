@@ -1,6 +1,5 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 @import "tailwindcss";
-@import url('https://unpkg.com/leaflet@1.9.4/dist/leaflet.css');
 
 @layer utilities {
   .scrollbar-hide::-webkit-scrollbar {
@@ -9,6 +8,20 @@
   .scrollbar-hide {
     -ms-overflow-style: none;
     scrollbar-width: none;
+  }
+
+  /* Safe-area helpers (iOS/Android com notch/barra de gestos) */
+  .safe-pt {
+    padding-top: env(safe-area-inset-top);
+  }
+  .safe-pb {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .safe-pl {
+    padding-left: env(safe-area-inset-left);
+  }
+  .safe-pr {
+    padding-right: env(safe-area-inset-right);
   }
 
   .custom-scrollbar::-webkit-scrollbar {
@@ -20,6 +33,10 @@
   .custom-scrollbar::-webkit-scrollbar-thumb {
     @apply bg-blue-900/30 rounded-full hover:bg-blue-900/50 transition-colors;
   }
+}
+
+html, body, #root {
+  min-height: 100dvh;
 }
 
 @theme {
