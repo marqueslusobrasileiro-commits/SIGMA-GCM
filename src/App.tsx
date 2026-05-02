@@ -937,7 +937,8 @@ function App() {
   // Web: login Google via servidor (/api/auth/google → custom token) contorna auth/unauthorized-domain no SDK.
   // Mantém getRedirectResult só para sessões antigas que ainda usavam signInWithRedirect.
   useEffect(() => {
-    if (Capacitor.isNativePlatform()) return;
+    // isNativePlatform pode falhar em alguns browsers/embeds; em web sempre tentamos concluir o login via servidor.
+    if (Capacitor.getPlatform() !== 'web') return;
     const params = new URLSearchParams(window.location.search);
     if (params.get('google_login') === 'error') {
       setError(
@@ -959,14 +960,7 @@ function App() {
       } catch (e) {
         console.warn('google web auth complete:', e);
       }
-      // Na web o login Google é só via servidor; getRedirectResult do SDK costuma dar auth/unauthorized-domain se restou estado antigo.
-      if (Capacitor.getPlatform() === 'web') return;
-      try {
-        const result = await getRedirectResult(auth);
-        if (result?.user) setError(null);
-      } catch (err: unknown) {
-        console.warn('getRedirectResult error:', err);
-      }
+      // Na web o login Google é só via servidor; não chamamos getRedirectResult aqui.
     })();
   }, []);
 
