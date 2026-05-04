@@ -6,6 +6,28 @@ function isHttpProtocol(p: string): boolean {
   return p === "http:" || p === "https:";
 }
 
+function defaultTimeoutMsForPath(pathname: string): number {
+  // Rotas que podem demorar (SMTP / cold start do Render).
+  if (pathname.includes("/api/shift-reports/send")) return 180_000;
+  if (pathname.includes("/api/shift-reports/upload")) return 180_000;
+  return 60_000;
+}
+
+async function fetchWithTimeout(url: string, init: RequestInit | undefined, ms: number): Promise<Response> {
+  if (typeof AbortSignal !== "undefined" && typeof (AbortSignal as any).timeout === "function") {
+    const signal = (AbortSignal as any).timeout(ms) as AbortSignal;
+    return await fetch(url, { ...(init || {}), signal });
+  }
+
+  const controller = new AbortController();
+  const t = window.setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { ...(init || {}), signal: controller.signal });
+  } finally {
+    window.clearTimeout(t);
+  }
+}
+
 /**
  * Resolve a URL base do backend.
  *
@@ -43,7 +65,9 @@ export function apiUrl(pathname: string): string {
 
 export async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
   if (typeof input === "string" && input.startsWith("/")) {
-    return await fetch(apiUrl(input), init);
+    const url = apiUrl(input);
+    const ms = defaultTimeoutMsForPath(input);
+    return await fetchWithTimeout(url, init, ms);
   }
   return await fetch(input as any, init);
 }
