@@ -33,14 +33,35 @@ export async function sharePdfBlob(blob: Blob, filename: string, title?: string)
   const safeName = (filename || "relatorio.pdf").replace(/[\\/:*?"<>|]+/g, "_");
   const path = `reports/${Date.now()}-${safeName}`;
 
-  await Filesystem.writeFile({
-    path,
-    data: base64,
-    directory: Directory.Cache,
-    recursive: true,
-  });
+  // Em alguns Androids, compartilhar a partir do Cache pode falhar ("file read failed").
+  // Preferimos Documents e caímos para Cache só se necessário.
+  let directory: Directory = Directory.Documents;
+  try {
+    await Filesystem.writeFile({
+      path,
+      data: base64,
+      directory,
+      recursive: true,
+    });
+  } catch (e) {
+    console.warn("[pdf] writeFile Documents falhou; tentando Cache:", e);
+    directory = Directory.Cache;
+    await Filesystem.writeFile({
+      path,
+      data: base64,
+      directory,
+      recursive: true,
+    });
+  }
 
-  const uri = await Filesystem.getUri({ path, directory: Directory.Cache });
+  try {
+    const st = await Filesystem.stat({ path, directory });
+    console.info("[pdf] arquivo pronto para compartilhar", { path, directory, size: st.size });
+  } catch (e) {
+    console.warn("[pdf] stat falhou (ainda tentaremos compartilhar):", { path, directory, e });
+  }
+
+  const uri = await Filesystem.getUri({ path, directory });
 
   await Share.share({
     title: title || safeName,

@@ -6,4 +6,19 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Credenciais locais (nunca commitar)
+serviceAccountKey.json
+**/google-services.json
+
+# Artefatos Android / IDE
+*.apk
+*.aab
+android/app/build/
+android/.gradle/
+android/.idea/
+.idea/
+.cursor/
+
+# Uploads locais do servidor (evitar lixo no repo)
 server/uploads/

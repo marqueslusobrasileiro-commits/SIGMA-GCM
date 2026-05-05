@@ -4,13 +4,14 @@ import L from 'leaflet';
 import MarkerClusterGroup from 'react-leaflet-cluster';
 import { format, isToday } from 'date-fns';
 import { 
-  MapPin, AlertTriangle, Shield, Info, Navigation, Search, X, 
+  MapPin, AlertTriangle, Info, Navigation, Search, X, 
   Maximize2, Globe, Crosshair, Layers, ChevronLeft, ChevronRight, 
   ZoomIn, Plus, Minus, CheckCircle2, Clock, Users, PlayCircle,
   TrendingUp, Activity, LayoutDashboard, CarFront, ChevronUp, ChevronDown
 } from 'lucide-react';
 import { PatrolRecord, OccurrenceRecord, PublicProperty, VehicleLocation, Geofence, OperationalAlert } from '../types';
 import { cn } from '../lib/utils';
+import appLogo from '../assets/sigma-brand.png';
 
 // Fix for default marker icons in Leaflet
 delete (L.Icon.Default.prototype as any)._getIconUrl;
@@ -92,7 +93,6 @@ const createGCMIcon = (status?: string, visitCount: number = 0) => {
   const isVisited = status === 'visited';
   const isOccurrence = status === 'occurrence';
   
-  const shieldColor = '#1e3a8a'; // Deep blue
   const badgeColor = isVisited ? '#10b981' : '#ef4444';
   const badgeIcon = isVisited ? 
     '<path d="M20 6L9 17l-5-5" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>' : 
@@ -100,27 +100,30 @@ const createGCMIcon = (status?: string, visitCount: number = 0) => {
 
   const countBadge =
     visitCount > 1
-      ? `<div style="position:absolute; top:-6px; left:-6px; background:#f59e0b; color:white; border-radius:9999px; min-width:20px; height:20px; padding:0 6px; border:2px solid white; display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:900; box-shadow:0 2px 4px rgba(0,0,0,0.3); z-index:11;">
+      ? `<div style="position:absolute; top:-4px; left:-4px; background:#f59e0b; color:white; border-radius:9999px; min-width:20px; height:20px; padding:0 6px; border:2px solid white; display:flex; align-items:center; justify-content:center; font-size:11px; font-weight:900; box-shadow:0 2px 4px rgba(0,0,0,0.3); z-index:11;">
            ${visitCount}
          </div>`
       : '';
 
+  const gradId = `gcm-shield-grad-${Math.random().toString(36).slice(2, 11)}`;
+
   return L.divIcon({
     html: `<div class="relative" style="width: 42px; height: 48px;">
-            <!-- Shield Shape -->
-            <svg width="42" height="48" viewBox="0 0 24 24" fill="${shieldColor}" stroke="white" stroke-width="1.5" style="filter: drop-shadow(0 4px 6px rgba(0,0,0,0.4));">
-              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            <!-- Marca SIGMA (escudo institucional) -->
+            <svg width="40" height="48" viewBox="0 0 40 48" style="display:block;filter:drop-shadow(0 4px 10px rgba(0,0,0,0.45));" aria-hidden="true">
+              <defs>
+                <linearGradient id="${gradId}" x1="20" y1="2" x2="20" y2="44" gradientUnits="userSpaceOnUse">
+                  <stop offset="0%" stop-color="#0f3d73"/>
+                  <stop offset="100%" stop-color="#041526"/>
+                </linearGradient>
+              </defs>
+              <path d="M20 2 L36 10 L36 26 C36 34 28 42 20 46 C12 42 4 34 4 26 L4 10 Z" fill="url(#${gradId})" stroke="rgba(255,255,255,0.95)" stroke-width="2" stroke-linejoin="round"/>
+              <text x="20" y="24" text-anchor="middle" fill="#ffffff" font-size="13" font-weight="900" font-family="system-ui,Segoe UI,sans-serif">Σ</text>
+              <text x="20" y="34" text-anchor="middle" fill="#ffffff" font-size="7.5" font-weight="800" font-family="system-ui,Segoe UI,sans-serif" opacity="0.9">GCM</text>
             </svg>
             ${countBadge}
-            <!-- GCM Logo (Simplified) -->
-            <div style="position: absolute; top: 12px; left: 11px; color: white; opacity: 0.9;">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                <circle cx="12" cy="12" r="9"/>
-                <path d="M12 7v10M7 12h10"/>
-              </svg>
-            </div>
             <!-- Status Badge -->
-            <div style="position: absolute; top: 0px; right: -4px; background: ${badgeColor}; border-radius: 50%; width: 20px; height: 20px; border: 2px solid white; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 4px rgba(0,0,0,0.3); z-index: 10;">
+            <div style="position: absolute; top: 2px; right: -4px; background: ${badgeColor}; border-radius: 50%; width: 20px; height: 20px; border: 2px solid white; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 4px rgba(0,0,0,0.3); z-index: 10;">
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none">
                 ${badgeIcon}
               </svg>
@@ -629,7 +632,9 @@ export const PatrolMap: React.FC<PatrolMapProps> = ({
                       status === 'visited' ? "bg-green-600" : 
                       status === 'occurrence' ? "bg-red-600" : "bg-blue-900")}>
                       <div className="flex items-center gap-2">
-                        <Shield className="w-4 h-4" />
+                        <span className="sigma-brand-frame sigma-brand-frame--sm inline-flex h-7 w-7 flex-shrink-0 ring-1 ring-white/35">
+                          <img src={appLogo} alt="" decoding="async" />
+                        </span>
                         <span className="font-bold text-xs uppercase tracking-wider">Posto GCM</span>
                       </div>
                       <Badge variant="outline" className="text-[10px] border-white/30 text-white">

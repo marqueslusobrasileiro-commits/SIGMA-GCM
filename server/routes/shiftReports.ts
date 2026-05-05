@@ -18,6 +18,9 @@ function getMailTransportIfConfigured() {
     port,
     secure: port === 465,
     auth: { user, pass },
+    connectionTimeout: 20_000,
+    greetingTimeout: 20_000,
+    socketTimeout: 60_000,
   });
 }
 
@@ -68,6 +71,69 @@ async function ensureUploadDir() {
   const dir = path.resolve(process.cwd(), "server", "uploads", "shift_reports");
   await fs.mkdir(dir, { recursive: true });
   return dir;
+}
+
+function absolutizeDownloadUrl(downloadUrl: string, req?: express.Request): string | null {
+  const u = String(downloadUrl || "").trim();
+  if (!u) return null;
+  if (/^https?:\/\//i.test(u)) return u;
+
+  const envBase = String(process.env.RENDER_EXTERNAL_URL || "").trim().replace(/\/$/, "");
+  const reqBase =
+    req && req.get("host")
+      ? `${String(req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim() || "https"}://${req.get("host")}`.replace(
+          /\/$/,
+          "",
+        )
+      : "";
+
+  const base = (envBase || reqBase).replace(/\/$/, "");
+  if (!base) return null;
+  if (!u.startsWith("/")) return `${base}/${u}`;
+  return `${base}${u}`;
+}
+
+async function readPdfBufferForEmail(opts: {
+  reportId: string;
+  data: any;
+  authHeader: string | undefined;
+  req?: express.Request;
+}): Promise<Buffer> {
+  const { reportId, data, authHeader, req } = opts;
+
+  const filePath = String(data?.localPath || "").trim();
+  if (filePath) {
+    try {
+      return await fs.readFile(filePath);
+    } catch (e: any) {
+      const code = e?.code as string | undefined;
+      if (code !== "ENOENT") throw e;
+      // eslint-disable-next-line no-console
+      console.warn("[shift-reports] localPath missing on disk; will try downloadUrl fallback", {
+        reportId,
+        filePath,
+      });
+    }
+  }
+
+  const downloadAbs = absolutizeDownloadUrl(String(data?.downloadUrl || ""), req);
+  if (downloadAbs) {
+    const resp = await fetch(downloadAbs, {
+      method: "GET",
+      headers: authHeader ? { Authorization: authHeader } : undefined,
+    });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => "");
+      throw new Error(`Falha ao baixar PDF pela downloadUrl (HTTP ${resp.status}). ${txt}`.trim());
+    }
+    const buf = Buffer.from(await resp.arrayBuffer());
+    if (!buf.length) throw new Error("PDF baixado está vazio.");
+    return buf;
+  }
+
+  throw new Error(
+    "Arquivo do relatório não está disponível no servidor (disco efêmero) e não foi possível resolver downloadUrl para baixar o PDF. Reenvie o relatório (upload) ou verifique host/proxy do servidor.",
+  );
 }
 
 export function registerShiftReportRoutes(app: express.Express) {
@@ -221,6 +287,35 @@ export function registerShiftReportRoutes(app: express.Express) {
       res.send(file);
     } catch (e) {
       console.error("[shift-reports] file read failed", e);
+
+      // Fallback: se o relatório veio do Firebase Storage (delivery=storage), o disco do Render não terá o arquivo.
+      // Tentamos baixar pelo `downloadUrl` absoluto quando ele NÃO aponta para esta mesma rota.
+      try {
+        const downloadAbs = absolutizeDownloadUrl(String(data?.downloadUrl || ""), req);
+        const selfPrefix = `/api/shift-reports/file/${encodeURIComponent(reportId)}`;
+        const isSelf =
+          !!downloadAbs &&
+          (downloadAbs.endsWith(selfPrefix) ||
+            downloadAbs.includes(`/api/shift-reports/file/${encodeURIComponent(reportId)}`));
+
+        if (downloadAbs && /^https?:\/\//i.test(downloadAbs) && !isSelf) {
+          // eslint-disable-next-line no-console
+          console.warn("[shift-reports] fallback downloadUrl", { reportId, downloadAbs });
+          const resp = await fetch(downloadAbs, { method: "GET" });
+          if (!resp.ok) {
+            const txt = await resp.text().catch(() => "");
+            throw new Error(`downloadUrl HTTP ${resp.status}. ${txt}`.trim());
+          }
+          const buf = Buffer.from(await resp.arrayBuffer());
+          if (!buf.length) throw new Error("downloadUrl retornou PDF vazio.");
+          res.setHeader("Content-Type", "application/pdf");
+          res.setHeader("Content-Disposition", `inline; filename="${String(data?.filename || "relatorio.pdf")}"`);
+          return res.send(buf);
+        }
+      } catch (fallbackErr) {
+        console.error("[shift-reports] fallback downloadUrl failed", fallbackErr);
+      }
+
       res.status(500).send("file read failed");
     }
   });
@@ -357,76 +452,84 @@ export function registerShiftReportRoutes(app: express.Express) {
 
   // Envio opcional por e-mail (somente ADM MASTER) usando o arquivo salvo no servidor.
   app.post("/api/shift-reports/send/:reportId", async (req, res) => {
-    // eslint-disable-next-line no-console
-    console.log("[shift-reports] send(manual) request received", {
-      hasAuth: !!req.headers.authorization,
-      reportId: req.params.reportId,
-    });
-    const decoded = await requireFirebaseAuth(req, res);
-    if (!decoded) return;
-
-    const access = await getUserAccess(decoded.uid);
-    if (!isMasterAdmin(access)) {
-      return res.status(403).json({ error: "Somente o ADM MASTER pode enviar por e-mail." });
-    }
-
-    const transport = getMailTransportIfConfigured();
-    if (!transport) {
-      return res.status(501).json({
-        error:
-          "SMTP não configurado. Configure SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS (e SMTP_FROM) no servidor.",
+    try {
+      // eslint-disable-next-line no-console
+      console.log("[shift-reports] send(manual) request received", {
+        hasAuth: !!req.headers.authorization,
+        reportId: req.params.reportId,
       });
-    }
+      const decoded = await requireFirebaseAuth(req, res);
+      if (!decoded) return;
 
-    const adminEmail = requireConfiguredEmailOrRespond(res);
-    if (!adminEmail) return;
+      const access = await getUserAccess(decoded.uid);
+      if (!isMasterAdmin(access)) {
+        return res.status(403).json({ error: "Somente o ADM MASTER pode enviar por e-mail." });
+      }
 
-    const reportId = String(req.params.reportId || "");
-    const snap = await db.collection("shift_reports").doc(reportId).get();
-    if (!snap.exists) return res.status(404).json({ error: "Relatório não encontrado." });
-    const data = snap.data() as any;
+      const transport = getMailTransportIfConfigured();
+      if (!transport) {
+        return res.status(501).json({
+          error:
+            "SMTP não configurado. Configure SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS (e SMTP_FROM) no servidor.",
+        });
+      }
 
-    const filePath = String(data?.localPath || "");
-    if (!filePath) return res.status(404).json({ error: "Arquivo do relatório não está disponível no servidor." });
+      const adminEmail = requireConfiguredEmailOrRespond(res);
+      if (!adminEmail) return;
 
-    const buffer = await fs.readFile(filePath);
-    const subject = `SIGMA-GCM - Relatório de Plantão (${data?.agentName || "-"})`;
-    const text = [
-      "Relatório de Plantão anexado.",
-      "",
-      `Agente: ${data?.agentName || "-"}`,
-      `Matrícula: ${data?.registration || "-"}`,
-      `Equipe: ${data?.teamName || "-"}`,
-      `Viatura: ${data?.vehiclePrefix || "-"}`,
-      `Turno: ${data?.shift || "-"}`,
-      `Período: ${data?.windowStart || "-"} – ${data?.windowEnd || "-"}`,
-      "",
-      "Envio acionado manualmente pelo ADM MASTER (SIGMA-GCM).",
-    ].join("\n");
+      const reportId = String(req.params.reportId || "");
+      const snap = await db.collection("shift_reports").doc(reportId).get();
+      if (!snap.exists) return res.status(404).json({ error: "Relatório não encontrado." });
+      const data = snap.data() as any;
 
-    await transport.sendMail({
-      from: process.env.SMTP_FROM || process.env.SMTP_USER,
-      to: adminEmail,
-      subject,
-      text,
-      attachments: [
+      const buffer = await readPdfBufferForEmail({
+        reportId,
+        data,
+        authHeader: req.headers.authorization,
+        req,
+      });
+      const subject = `SIGMA-GCM - Relatório de Plantão (${data?.agentName || "-"})`;
+      const text = [
+        "Relatório de Plantão anexado.",
+        "",
+        `Agente: ${data?.agentName || "-"}`,
+        `Matrícula: ${data?.registration || "-"}`,
+        `Equipe: ${data?.teamName || "-"}`,
+        `Viatura: ${data?.vehiclePrefix || "-"}`,
+        `Turno: ${data?.shift || "-"}`,
+        `Período: ${data?.windowStart || "-"} – ${data?.windowEnd || "-"}`,
+        "",
+        "Envio acionado manualmente pelo ADM MASTER (SIGMA-GCM).",
+      ].join("\n");
+
+      await transport.sendMail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to: adminEmail,
+        subject,
+        text,
+        attachments: [
+          {
+            filename: String(data?.filename || "relatorio.pdf"),
+            content: buffer,
+            contentType: "application/pdf",
+          },
+        ],
+      });
+
+      await snap.ref.set(
         {
-          filename: String(data?.filename || "relatorio.pdf"),
-          content: buffer,
-          contentType: "application/pdf",
+          emailTo: adminEmail,
+          emailSentAt: new Date().toISOString(),
         },
-      ],
-    });
+        { merge: true },
+      );
 
-    await snap.ref.set(
-      {
-        emailTo: adminEmail,
-        emailSentAt: new Date().toISOString(),
-      },
-      { merge: true },
-    );
-
-    res.json({ ok: true });
+      res.json({ ok: true });
+    } catch (err) {
+      console.error("[shift-reports] send(manual) failed:", err);
+      const msg = err instanceof Error ? err.message : String(err);
+      res.status(500).json({ error: msg || "Falha ao enviar e-mail." });
+    }
   });
 
   // Recebe um PDF (base64) e envia para o ADM MASTER por e-mail, gravando metadados no Firestore.

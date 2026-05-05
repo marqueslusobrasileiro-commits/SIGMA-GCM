@@ -100,12 +100,22 @@ export interface PublicProperty {
   longitude: number;
   qrCode: string;
   plusCode: string;
+  /** Raio permitido para validação GPS (metros). Default no app: 50. */
+  validationRadiusMeters?: number | null;
   manager?: string;
   status: 'operational' | 'maintenance' | 'closed';
   lastVisit?: string;
   deletedAt?: string | null;
   deletedBy?: string | null;
 }
+
+export type PatrolValidationStatus = 'VALIDO' | 'FORA_DO_RAIO';
+
+/** Metadados opcionais do GPS no registro da ronda. */
+export type PatrolGpsMeta = {
+  accuracyMeters?: number | null;
+  simulatedLocation?: boolean;
+};
 
 export interface PatrolRecord {
   id: string;
@@ -123,8 +133,28 @@ export interface PatrolRecord {
   propertyName: string;
   plusCode: string;
   timestamp: string;
+  /** Posição do agente no momento do QR (GPS). */
   latitude: number;
   longitude: number;
+  /** Ponto de referência do posto usado na validação (centro do Plus Code ou lat/lng cadastral). */
+  propertyLatitude?: number;
+  propertyLongitude?: number;
+  /** De onde veio o ponto de referência (Plus Code decodificado vs lat/lng do cadastro). */
+  propertyAnchorSource?: "plusCode" | "coordinates";
+  /** Distância calculada posto × agente (metros). */
+  distanceMeters?: number;
+  /** Raio permitido usado na validação (metros). */
+  allowedRadiusMeters?: number;
+  /** Resultado da regra antifraude por distância (ausente = legado, tratar como válido). */
+  validationStatus?: PatrolValidationStatus;
+  /** Precisão informada pelo GPS (metros), se disponível. */
+  gpsAccuracyMeters?: number | null;
+  /** true se accuracy > limiar operacional (GPS fraco). */
+  gpsLowConfidence?: boolean;
+  /** Localização simulada (fluxo de teste do app). */
+  simulatedLocation?: boolean;
+  /** Reservado para detecção nativa de mock (Web: em geral false). */
+  mockLocationSuspected?: boolean;
   status: 'normal' | 'attention' | 'urgent';
   observation: string;
   photoUrl?: string;
@@ -152,7 +182,7 @@ export interface AuditLog {
   action: string;
   details: string;
   targetId?: string;
-  targetType?: 'user' | 'property' | 'vehicle' | 'team' | 'alert';
+  targetType?: 'user' | 'property' | 'vehicle' | 'team' | 'alert' | 'patrol';
   timestamp: string;
 }
 
@@ -171,7 +201,9 @@ export interface ShiftReport {
   shift: string;
   windowStart: string;
   windowEnd: string;
-  delivery?: 'storage' | 'server' | 'email' | 'none';
+  delivery?: 'storage' | 'server' | 'email' | 'none' | 'metadata_only';
+  /** Quando só há registro no Firestore (ex.: Storage não disponível no plano Spark). */
+  pdfNote?: string;
   emailTo?: string;
   emailSentAt?: string;
   deletedAt?: string | null;

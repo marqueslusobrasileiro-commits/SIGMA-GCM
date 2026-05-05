@@ -18,28 +18,73 @@ service cloud.firestore {
       return isAuthenticated() && getUserData().role == role;
     }
 
+    // ADMIN por perfil (múltiplos admins). Requer perfil ATIVO no Firestore.
     function isAdmin() {
-      return (isAuthenticated() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && getUserData().role == 'admin' && getUserData().status == 'ATIVO') ||
-             (isAuthenticated() && request.auth.token.email == "marquesluso.brasileiro@gmail.com" && request.auth.token.email_verified == true);
+      return hasRole('admin') && isStatus('ATIVO');
+    }
+
+    // Admin mestre (único) por e-mail (para ações sensíveis: editar postos / exclusões).
+    // Mantemos explícito nas rules para garantir enforcement mesmo sem backend.
+    function isMasterAdmin() {
+      return isAdmin()
+        && request.auth.token.email != null
+        && request.auth.token.email == 'andersonf.g.marques@gmail.com';
+    }
+
+    // E-mail do ADM MASTER no token (sem depender do doc users/{uid}). Evita "permission denied"
+    // quando o perfil no Firestore está inconsistente mas o JWT é válido.
+    function isMasterEmailToken() {
+      return isAuthenticated()
+        && request.auth.token.email != null
+        && request.auth.token.email == 'andersonf.g.marques@gmail.com';
+    }
+
+    // Apenas metadados de lixeira em relatórios (sem alterar PDF/agente/período).
+    function shiftReportTrashPatchOnly() {
+      return request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['deletedAt', 'deletedBy']);
     }
 
     function isSupervisor() {
       return (hasRole('supervisor') && isStatus('ATIVO')) || isAdmin();
     }
 
-    function isAgent() {
-      return (hasRole('agent') && isStatus('ATIVO')) || isAdmin();
+    // Plantão em equipe: agente, comando ou supervisor ATIVO (mesmas operações de equipe/viatura em campo).
+    function isOperationalCrew() {
+      return isAuthenticated()
+        && isStatus('ATIVO')
+        && (
+          hasRole('agent') ||
+          hasRole('command') ||
+          hasRole('supervisor')
+        );
+    }
+
+    // Perfil operacional com users/{uid}.teamId apontando para este documento (admin pode vincular sem preencher agentIds).
+    function profileLinksTeam(teamDocId) {
+      return isAuthenticated() && getUserData().teamId == teamDocId;
     }
     
     function isAtivo() {
       return isStatus('ATIVO') || isAdmin();
     }
 
+    function isVisitor() {
+      return isAuthenticated() && request.auth.token.firebase.sign_in_provider == 'anonymous';
+    }
+
     // User profiles
     match /users/{userId} {
       allow read: if isAuthenticated();
       // Allow creation for PENDENTE status during registration or by admin
-      allow create: if (isAuthenticated() && request.auth.uid == userId && request.resource.data.status == 'PENDENTE') || isAdmin();
+      allow create: if
+        // Auto-cadastro do próprio usuário (sempre PENDENTE e nunca admin)
+        (isAuthenticated()
+          && request.auth.uid == userId
+          && request.resource.data.status == 'PENDENTE'
+          && request.resource.data.role != 'admin')
+        // Admin pode criar perfis para usuários (inclui criar outro admin via painel/backend)
+        || isAdmin();
       // Only admin can update status or roles. Users can update their own non-sensitive data.
       allow update: if isAdmin() || (isAuthenticated() && request.auth.uid == userId && 
         request.resource.data.role == resource.data.role && 
@@ -49,8 +94,9 @@ service cloud.firestore {
 
     // Public Properties
     match /properties/{propertyId} {
-      allow read: if isAtivo();
-      allow create, update, delete: if isAdmin();
+      allow read: if isAtivo() || isVisitor();
+      // Somente o ADMIN MASTER pode criar/editar/excluir postos/próprios.
+      allow create, update, delete: if isMasterAdmin();
     }
 
     // Patrol logs
@@ -69,33 +115,49 @@ service cloud.firestore {
 
     // Teams
     match /teams/{teamId} {
-      allow read: if isAtivo();
+      allow read: if isAtivo() || isVisitor();
+      // Admin: controle total
       allow create, update, delete: if isAdmin();
+
+      // Agente / COMANDO / Supervisor ATIVO podem criar equipe de plantão (membro em agentIds).
+      allow create: if isOperationalCrew()
+        && request.resource.data.active == true
+        && request.resource.data.agentIds is list
+        && request.auth.uid in request.resource.data.agentIds;
+
+      // Atualizar plantão: membro em agentIds OU perfil vinculado a esta equipe (teamId).
+      allow update: if isOperationalCrew()
+        && (
+          (resource.data.agentIds is list && request.auth.uid in resource.data.agentIds)
+          || profileLinksTeam(teamId)
+        );
+
+      // Remoção de equipes fica restrita ao admin.
+      allow delete: if isAdmin();
     }
 
     // Vehicles
     match /vehicles/{vehicleId} {
-      allow read: if isAtivo();
+      allow read: if isAtivo() || isVisitor();
       allow create, update, delete: if isAdmin();
     }
 
     // Vehicle Locations (Real-time tracking)
     match /vehicle_locations/{locationId} {
-      allow read: if isSupervisor();
-      // Agents can update their own location
-      allow create, update: if isAgent();
+      allow read: if isAtivo() || isVisitor();
+      allow create, update: if isAdmin() || isOperationalCrew();
       allow delete: if isAdmin();
     }
 
     // Geofences
     match /geofences/{geofenceId} {
-      allow read: if isAtivo();
+      allow read: if isAtivo() || isVisitor();
       allow create, update, delete: if isAdmin();
     }
 
     // Operational Alerts
     match /alerts/{alertId} {
-      allow read: if isSupervisor();
+      allow read: if isAtivo() || isVisitor();
       // System or agents can create alerts
       allow create: if isAtivo();
       // Only supervisors/admins can resolve alerts
@@ -106,8 +168,52 @@ service cloud.firestore {
     // Audit Logs
     match /audit_logs/{logId} {
       allow read: if isAdmin();
-      allow create: if isAdmin();
+      allow create: if isAdmin()
+        || (
+          isAuthenticated()
+          && isAtivo()
+          && request.resource.data.action == 'RONDA_FORA_DO_RAIO'
+          && request.resource.data.adminId == request.auth.uid
+          && request.resource.data.targetType == 'patrol'
+        );
       allow update, delete: if false;
+    }
+
+    // Gemini Logs (written by backend/admin SDK; never by clients)
+    match /gemini_logs/{logId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
+    // Notifications (written by backend/admin SDK; never by clients)
+    match /notifications/{notificationId} {
+      allow read: if isAdmin();
+      allow create, update, delete: if false;
+    }
+
+    // Relatórios de Plantão (metadados; o PDF em si fica no Storage)
+    match /shift_reports/{reportId} {
+      // Admins (inclui master) conseguem ver todos os relatórios.
+      // Agente ATIVO pode ler apenas os próprios relatórios (necessário para validar envio obrigatório).
+      allow read: if isAdmin() || (isAtivo() && resource.data.agentId == request.auth.uid);
+      // Usuário ATIVO consegue registrar o relatório do próprio plantão.
+      // O conteúdo sensível (PDF) não é armazenado aqui, só metadados + link.
+      // Create: somente se o doc ainda não existir e estiver amarrado ao próprio usuário.
+      allow create: if isAtivo()
+        && request.resource.data.agentId == request.auth.uid
+        && !exists(/databases/$(database)/documents/shift_reports/$(reportId));
+      // Lixeira / restaurar: qualquer ADMIN ATIVO (patch só deletedAt/deletedBy).
+      // Purge (delete do doc): somente e-mail master no token (alinha ao botão do app).
+      allow update: if shiftReportTrashPatchOnly() && (isAdmin() || isMasterEmailToken());
+      allow delete: if isMasterEmailToken();
+    }
+
+    // Configurações globais do app (ex.: habilitar/desabilitar envio de e-mail de relatório)
+    match /settings/{docId} {
+      // Usuários ATIVOS precisam ler para o app respeitar a configuração.
+      allow read: if isAtivo();
+      // Somente o ADM MASTER pode alterar configurações globais.
+      allow create, update, delete: if isMasterAdmin();
     }
   }
 }

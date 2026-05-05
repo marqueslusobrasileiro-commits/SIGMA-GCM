@@ -1,7 +1,6 @@
 import React, { useMemo } from 'react';
 import { motion } from 'motion/react';
 import { 
-  Shield, 
   MapPin, 
   CheckCircle2, 
   Clock, 

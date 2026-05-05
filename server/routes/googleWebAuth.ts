@@ -25,6 +25,14 @@ function isSecureRequest(req: express.Request): boolean {
   return proto === "https" || req.secure === true;
 }
 
+function cookiePolicy(req: express.Request): { secure: boolean; sameSite: "lax" | "none" } {
+  // Em produção (Render), a navegação OAuth acontece em HTTPS e alguns browsers ficam mais estáveis
+  // com cookies `Secure` + `SameSite=None`.
+  const prodLike = process.env.RENDER === "true" || process.env.RENDER_EXTERNAL_URL !== undefined;
+  const secure = prodLike || isSecureRequest(req);
+  return { secure, sameSite: secure ? "none" : "lax" };
+}
+
 /**
  * Login Google na web via servidor: evita auth/unauthorized-domain do SDK no browser.
  *
@@ -32,16 +40,51 @@ function isSecureRequest(req: express.Request): boolean {
  * GCP → Credenciais → redirect: https://<host>/api/auth/google/callback
  */
 export function registerGoogleWebAuthRoutes(app: express.Express): void {
-  const clientId =
-    process.env.GOOGLE_OAUTH_CLIENT_ID ||
-    "343507031983-64oi12lm43bvgj1cu7lb7jca9uvnisgd.apps.googleusercontent.com";
-  const clientSecret = process.env.GOOGLE_OAUTH_CLIENT_SECRET || "";
+  const prodLike = process.env.RENDER === "true" || process.env.RENDER_EXTERNAL_URL !== undefined;
+  const clientIdEnv = String(process.env.GOOGLE_OAUTH_CLIENT_ID || "").trim();
+  const clientSecretEnv = String(process.env.GOOGLE_OAUTH_CLIENT_SECRET || "").trim();
+
+  function resolveClientId(): string {
+    if (clientIdEnv) return clientIdEnv;
+    // Em produção, NUNCA usar fallback hardcoded: isso causa `invalid_client` se o projeto OAuth for outro.
+    if (prodLike) return "";
+    // Dev local: mantém fallback antigo para não quebrar quem ainda não configurou env.
+    return "343507031983-64oi12lm43bvgj1cu7lb7jca9uvnisgd.apps.googleusercontent.com";
+  }
+
+  function resolveClientSecret(): string {
+    return clientSecretEnv;
+  }
+
+  // Endpoint de diagnóstico (não expõe segredos)
+  app.get("/api/auth/google/diag", (_req, res) => {
+    try {
+      const opts = admin.app().options as any;
+      return res.json({
+        ok: true,
+        adminProjectId: opts?.projectId ?? null,
+        adminCredentialProjectId: (opts?.credential as any)?.projectId ?? null,
+        envProjectId: process.env.FIREBASE_PROJECT_ID ?? null,
+        oauthClientIdPrefix: clientIdEnv ? clientIdEnv.slice(0, 12) : null,
+      });
+    } catch (e) {
+      return res.status(500).json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+    }
+  });
 
   app.get("/api/auth/google/start", (req, res) => {
     pruneExpired();
+    const clientId = resolveClientId();
+    const clientSecret = resolveClientSecret();
     if (!clientSecret) {
       res.status(503).send(
         "GOOGLE_OAUTH_CLIENT_SECRET não configurado. Defina no Render (Environment) o secret do cliente OAuth Web no Google Cloud.",
+      );
+      return;
+    }
+    if (!clientId) {
+      res.status(503).send(
+        "GOOGLE_OAUTH_CLIENT_ID não configurado. No Render, defina o Client ID do OAuth Web (Google Cloud → Credenciais) em GOOGLE_OAUTH_CLIENT_ID.",
       );
       return;
     }
@@ -50,15 +93,18 @@ export function registerGoogleWebAuthRoutes(app: express.Express): void {
     const state = crypto.randomBytes(24).toString("hex");
     const redirectUri = `${origin}/api/auth/google/callback`;
 
-    // eslint-disable-next-line no-console
-    console.log("[googleWebAuth] start", { origin, redirectUri });
-
     res.cookie("g_oauth_state", state, {
       httpOnly: true,
-      secure: isSecureRequest(req),
-      sameSite: "lax",
+      ...cookiePolicy(req),
       maxAge: 10 * 60 * 1000,
       path: "/",
+    });
+
+    // eslint-disable-next-line no-console
+    console.log("[googleWebAuth] start", {
+      origin,
+      redirectUri,
+      clientIdPrefix: clientId.slice(0, 12),
     });
 
     const params = new URLSearchParams({
@@ -77,7 +123,13 @@ export function registerGoogleWebAuthRoutes(app: express.Express): void {
   app.get("/api/auth/google/callback", async (req, res) => {
     pruneExpired();
 
+    const clientId = resolveClientId();
+    const clientSecret = resolveClientSecret();
     if (!clientSecret) {
+      res.redirect(`${publicOrigin(req)}/?google_login=error`);
+      return;
+    }
+    if (!clientId) {
       res.redirect(`${publicOrigin(req)}/?google_login=error`);
       return;
     }
@@ -147,18 +199,9 @@ export function registerGoogleWebAuthRoutes(app: express.Express): void {
 
       res.cookie("g_exchange", exchangeId, {
         httpOnly: true,
-        secure: isSecureRequest(req),
-        sameSite: "lax",
+        ...cookiePolicy(req),
         maxAge: 2 * 60 * 1000,
         path: "/",
-      });
-
-      // eslint-disable-next-line no-console
-      console.log("[googleWebAuth] callback ok (exchange set)", {
-        email,
-        hasExchange: true,
-        secureCookie: isSecureRequest(req),
-        origin,
       });
 
       res.redirect(`${origin}/`);
@@ -176,12 +219,6 @@ export function registerGoogleWebAuthRoutes(app: express.Express): void {
     res.clearCookie("g_exchange", { path: "/" });
 
     if (!exchangeId) {
-      // eslint-disable-next-line no-console
-      console.warn("[googleWebAuth] complete: sem cookie g_exchange", {
-        hasCookieHeader: !!req.headers.cookie,
-        secureReq: isSecureRequest(req),
-        origin: publicOrigin(req),
-      });
       return res.status(204).end();
     }
 
@@ -189,13 +226,9 @@ export function registerGoogleWebAuthRoutes(app: express.Express): void {
     pendingExchanges.delete(exchangeId);
 
     if (!pending || Date.now() > pending.exp) {
-      // eslint-disable-next-line no-console
-      console.warn("[googleWebAuth] complete: exchange expirado/ausente", { exchangeId });
       return res.status(401).json({ error: "expired" });
     }
 
-    // eslint-disable-next-line no-console
-    console.log("[googleWebAuth] complete: token ok", { exchangeId });
     return res.json({ firebaseCustomToken: pending.token });
   });
 }

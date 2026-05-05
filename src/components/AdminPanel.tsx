@@ -4,7 +4,6 @@ import {
   MapPin, 
   Truck, 
   History, 
-  Shield, 
   FileText,
   Plus,
   Edit2,
@@ -36,17 +35,50 @@ import {
   orderBy, 
   limit,
   where,
-  getDocs
+  getDocs,
+  Timestamp,
+  type QuerySnapshot,
 } from 'firebase/firestore';
 import { onAuthStateChanged } from 'firebase/auth';
 import { auth, db } from '../firebase';
-import { UserProfile, PublicProperty, Team, Vehicle, AuditLog, UserStatus, UserRole, ShiftReport } from '../types';
+import { UserProfile, PublicProperty, Team, Vehicle, AuditLog, UserStatus, UserRole, ShiftReport, PatrolRecord } from '../types';
+import { patrolEffectiveValidationStatus } from '../lib/patrolGeo';
 import { format } from 'date-fns';
 import { SUPER_ADMIN_EMAIL } from '../config';
 import { groupByDayBy } from '../lib/groupByDay';
 import { Capacitor } from '@capacitor/core';
-import { apiFetch, getApiBaseUrl } from '../lib/apiClient';
+import { apiFetch, apiFetchExternal, getApiBaseUrl, getExternalApiBaseUrl } from '../lib/apiClient';
+import {
+  resolveShiftReportPdfBlob,
+  shiftReportHasResolvablePdfSource,
+  trashShiftReportFirestore,
+  restoreShiftReportFirestore,
+  purgeShiftReportFirestore,
+} from '../lib/shiftReportFirebase';
 import { sharePdfBlob } from '../lib/nativePdf';
+import { addDocClean, setDocClean, updateDocClean } from '../lib/firestoreData';
+import appLogo from '../assets/sigma-brand.png';
+
+function patrolTimestampIsoFromFirestore(data: Record<string, unknown>): string {
+  const raw = data.timestamp;
+  if (raw instanceof Timestamp) return raw.toDate().toISOString();
+  if (typeof raw === 'string') return raw;
+  return '';
+}
+
+function mapFirestoreDocToPatrolRecord(d: { id: string; data: () => Record<string, unknown> }): PatrolRecord {
+  const data = d.data() as Record<string, unknown>;
+  return {
+    id: d.id,
+    ...data,
+    timestamp: patrolTimestampIsoFromFirestore(data),
+  } as PatrolRecord;
+}
+
+function patrolTimeMs(p: PatrolRecord): number {
+  const t = new Date(p.timestamp).getTime();
+  return Number.isFinite(t) ? t : 0;
+}
 
 interface AdminPanelProps {
   profile: UserProfile;
@@ -55,7 +87,9 @@ interface AdminPanelProps {
 }
 
 export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdminAction }) => {
-  const [activeTab, setActiveTab] = useState<'users' | 'properties' | 'vehicles' | 'teams' | 'logs' | 'reports'>('users');
+  const [activeTab, setActiveTab] = useState<
+    'users' | 'properties' | 'vehicles' | 'teams' | 'logs' | 'reports' | 'antifraud'
+  >('users');
   const [reportsView, setReportsView] = useState<'active' | 'trash'>('active');
   const [propertiesView, setPropertiesView] = useState<'active' | 'trash'>('active');
   const [selectedPropertyIds, setSelectedPropertyIds] = useState<Set<string>>(new Set());
@@ -81,6 +115,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
   const [editingVehicle, setEditingVehicle] = useState<Vehicle | null>(null);
   const [showTeamModal, setShowTeamModal] = useState(false);
   const [editingTeam, setEditingTeam] = useState<Team | null>(null);
+  const [patrolAntifraudRows, setPatrolAntifraudRows] = useState<PatrolRecord[]>([]);
+  const [patrolAntifraudError, setPatrolAntifraudError] = useState<string | null>(null);
+  const [antifraudSince, setAntifraudSince] = useState<string>(() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 365);
+    return format(d, 'yyyy-MM-dd');
+  });
 
   const isLocalhost =
     typeof window !== 'undefined' &&
@@ -92,6 +133,10 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
     typeof window !== 'undefined' && (window.location.port === '4173' || window.location.port === '5173');
 
   const isMasterAdmin = (profile.email || '').toLowerCase() === SUPER_ADMIN_EMAIL.toLowerCase();
+  /** Qualquer administrador ATIVO pode mover/restaurar relatório na lixeira (metadados). Purge continua só master. */
+  const canModerateShiftReports = profile.role === 'admin' && profile.status === 'ATIVO';
+  /** Antifraude: leitura de rondas — qualquer admin ATIVO (Firestore já permite read em patrols para isAtivo). */
+  const canViewAntifraud = profile.role === 'admin' && profile.status === 'ATIVO';
   const activeReports = reports.filter((r) => !r.deletedAt);
   const trashedReports = reports.filter((r) => !!r.deletedAt);
   const visibleReports = reportsView === 'trash' ? trashedReports : activeReports;
@@ -131,52 +176,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
     DELTA: 'Noturno',
   };
 
-  const fetchReportPdfBlob = async (reportId: string): Promise<Blob> => {
-    const u = auth.currentUser;
-    if (!u) throw new Error('Sessão expirada.');
-    const token = await u.getIdToken();
-    const resp = await apiFetch(`/api/shift-reports/file/${encodeURIComponent(reportId)}`, {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${token}` },
-    });
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => '');
-      throw new Error(text || `Falha ao baixar PDF (HTTP ${resp.status})`);
-    }
-
-    const contentType = (resp.headers.get('content-type') || '').toLowerCase();
-    const blob = await resp.blob();
-
-    // Garante que recebemos um PDF de verdade (no APK é comum salvar JSON/HTML como ".pdf" sem perceber).
-    if (!contentType.includes('application/pdf')) {
-      const txt = await blob.text().catch(() => '');
-      // tenta extrair erro JSON {error:"..."}
-      try {
-        const parsed = JSON.parse(txt);
-        const msg = typeof parsed?.error === 'string' ? parsed.error : txt;
-        throw new Error(msg || `Resposta inválida do servidor (Content-Type: ${contentType || 'desconhecido'})`);
-      } catch {
-        throw new Error(
-          (txt && txt.slice(0, 300)) ||
-            `Resposta inválida do servidor (Content-Type: ${contentType || 'desconhecido'})`,
-        );
-      }
-    }
-
-    // Verifica assinatura "%PDF-" nos primeiros bytes
-    try {
-      const head = new Uint8Array(await blob.slice(0, 5).arrayBuffer());
-      const sig = String.fromCharCode(...Array.from(head));
-      if (sig !== '%PDF-') {
-        throw new Error('Arquivo recebido não parece ser um PDF válido.');
-      }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      throw new Error(msg || 'Falha ao validar PDF.');
-    }
-
-    return blob;
-  };
+  const reportHasPdfSource = (r: ShiftReport) => shiftReportHasResolvablePdfSource(r);
 
   const downloadBlob = (blob: Blob, filename: string) => {
     const url = URL.createObjectURL(blob);
@@ -252,6 +252,81 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
     setHasUnreadReports(false);
   }, [activeTab, profile?.uid, activeReports]);
 
+  useEffect(() => {
+    if (!canViewAntifraud || activeTab !== 'antifraud') return;
+    setPatrolAntifraudError(null);
+    let unsub: (() => void) | undefined;
+
+    const applySnapshot = (snap: QuerySnapshot) => {
+      const rows = snap.docs.map(mapFirestoreDocToPatrolRecord);
+      rows.sort((a, b) => patrolTimeMs(b) - patrolTimeMs(a));
+      setPatrolAntifraudError(null);
+      setPatrolAntifraudRows(rows.slice(0, 2000));
+    };
+
+    const qOrdered = query(collection(db, 'patrols'), orderBy('timestamp', 'desc'), limit(1500));
+    unsub = onSnapshot(
+      qOrdered,
+      applySnapshot,
+      (err) => {
+        // Tipos mistos em `timestamp` (string ISO vs Timestamp) quebram orderBy no Firestore.
+        console.warn('[antifraude] orderBy(timestamp) falhou; usando leitura sem ordenação do servidor:', err);
+        try {
+          unsub?.();
+        } catch {
+          /* noop */
+        }
+        unsub = undefined;
+        const qPlain = query(collection(db, 'patrols'), limit(2500));
+        unsub = onSnapshot(
+          qPlain,
+          applySnapshot,
+          (err2) => {
+            console.error('[antifraude] patrols (fallback):', err2);
+            setPatrolAntifraudError(
+              (err2 as Error)?.message ||
+                'Não foi possível carregar rondas. Confira permissões (admin ATIVO) e conexão.',
+            );
+            setPatrolAntifraudRows([]);
+          },
+        );
+      },
+    );
+
+    return () => {
+      try {
+        unsub?.();
+      } catch {
+        /* noop */
+      }
+    };
+  }, [canViewAntifraud, activeTab]);
+
+  /** Irregulares entre as rondas já carregadas (ignora filtro de data — diagnóstico). */
+  const irregularAllLoaded = useMemo(
+    () => patrolAntifraudRows.filter((p) => patrolEffectiveValidationStatus(p) === 'FORA_DO_RAIO'),
+    [patrolAntifraudRows],
+  );
+
+  const irregularPatrolsFiltered = useMemo(() => {
+    const sinceMs = new Date(`${antifraudSince}T00:00:00`).getTime();
+    return patrolAntifraudRows.filter((p) => {
+      if (patrolEffectiveValidationStatus(p) !== 'FORA_DO_RAIO') return false;
+      const t = new Date(p.timestamp).getTime();
+      return Number.isFinite(t) && t >= sinceMs;
+    });
+  }, [patrolAntifraudRows, antifraudSince]);
+
+  const irregularByAgent = useMemo(() => {
+    const m = new Map<string, { name: string; count: number }>();
+    for (const p of irregularPatrolsFiltered) {
+      const prev = m.get(p.agentId) || { name: p.agentName, count: 0 };
+      prev.count += 1;
+      m.set(p.agentId, prev);
+    }
+    return [...m.entries()].sort((a, b) => b[1].count - a[1].count);
+  }, [irregularPatrolsFiltered]);
+
   const handleSaveVehicle = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const formData = new FormData(e.currentTarget);
@@ -265,10 +340,10 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
 
     try {
       if (editingVehicle) {
-        await updateDoc(doc(db, 'vehicles', editingVehicle.id), vehicleData);
+        await updateDocClean(doc(db, 'vehicles', editingVehicle.id), vehicleData as unknown as Record<string, unknown>);
         await logAdminAction(profile, 'EDIÇÃO DE VIATURA', `Viatura ${vehicleData.prefix} editada.`, editingVehicle.id, 'vehicle');
       } else {
-        const docRef = await addDoc(collection(db, 'vehicles'), vehicleData);
+        const docRef = await addDocClean(collection(db, 'vehicles'), vehicleData as unknown as Record<string, unknown>);
         await logAdminAction(profile, 'CRIAÇÃO DE VIATURA', `Viatura ${vehicleData.prefix} criada.`, docRef.id, 'vehicle');
       }
       setShowVehicleModal(false);
@@ -305,10 +380,10 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
 
     try {
       if (editingTeam) {
-        await updateDoc(doc(db, 'teams', editingTeam.id), teamData);
+        await updateDocClean(doc(db, 'teams', editingTeam.id), teamData as unknown as Record<string, unknown>);
         await logAdminAction(profile, 'EDIÇÃO DE EQUIPE', `Equipe ${teamData.name} editada.`, editingTeam.id, 'team');
       } else {
-        const docRef = await addDoc(collection(db, 'teams'), teamData);
+        const docRef = await addDocClean(collection(db, 'teams'), teamData as unknown as Record<string, unknown>);
         await logAdminAction(profile, 'CRIAÇÃO DE EQUIPE', `Equipe ${teamData.name} criada.`, docRef.id, 'team');
       }
       setShowTeamModal(false);
@@ -333,6 +408,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
   const handleSaveProperty = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
     const formData = new FormData(e.currentTarget);
+    const vrRaw = formData.get('validationRadiusMeters');
+    let validationRadiusMeters: number | null = null;
+    if (vrRaw != null && String(vrRaw).trim() !== '') {
+      const n = Number(vrRaw);
+      if (Number.isFinite(n) && n >= 10 && n <= 5000) validationRadiusMeters = Math.round(n);
+    }
+
     const propData = {
       name: formData.get('name') as string,
       category: formData.get('category') as string,
@@ -341,6 +423,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
       longitude: Number(formData.get('longitude')),
       plusCode: formData.get('plusCode') as string,
       qrCode: formData.get('qrCode') as string || `GCM-${Date.now()}`,
+      validationRadiusMeters,
       status: 'operational' as const,
       deletedAt: null as string | null,
       deletedBy: null as string | null,
@@ -348,7 +431,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
 
     try {
       if (editingProperty) {
-        await updateDoc(doc(db, 'properties', editingProperty.id), propData);
+        await updateDocClean(doc(db, 'properties', editingProperty.id), propData as unknown as Record<string, unknown>);
         // Fecha o modal imediatamente após salvar o Firestore.
         // Auditoria roda em segundo plano para não travar UX.
         setShowPropertyModal(false);
@@ -356,7 +439,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
         void logAdminAction(profile, 'EDIÇÃO DE POSTO', `Posto ${propData.name} editado.`, editingProperty.id, 'property')
           .catch((logErr) => console.warn('Falha ao registrar auditoria (edição de posto):', logErr));
       } else {
-        const docRef = await addDoc(collection(db, 'properties'), propData);
+        const docRef = await addDocClean(collection(db, 'properties'), propData as unknown as Record<string, unknown>);
         setShowPropertyModal(false);
         setEditingProperty(null);
         void logAdminAction(profile, 'CRIAÇÃO DE POSTO', `Posto ${propData.name} criado.`, docRef.id, 'property')
@@ -372,7 +455,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
     // Agora "excluir" é Lixeira (soft delete). Purge é separado.
     if (!window.confirm(`Mover o posto "${prop.name}" para a Lixeira?`)) return;
     try {
-      await updateDoc(doc(db, 'properties', prop.id), {
+      await updateDocClean(doc(db, 'properties', prop.id), {
         deletedAt: new Date().toISOString(),
         deletedBy: profile.uid,
       });
@@ -386,7 +469,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
   const handleRestoreProperty = async (prop: PublicProperty) => {
     if (!window.confirm(`Restaurar o posto "${prop.name}" da Lixeira?`)) return;
     try {
-      await updateDoc(doc(db, 'properties', prop.id), { deletedAt: null, deletedBy: null });
+      await updateDocClean(doc(db, 'properties', prop.id), { deletedAt: null, deletedBy: null });
       await logAdminAction(profile, 'RESTAURAR (POSTO)', `Posto ${prop.name} restaurado da Lixeira.`, prop.id, 'property');
     } catch (err) {
       console.error(err);
@@ -426,7 +509,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
     try {
       await Promise.all(
         ids.map((id) =>
-          updateDoc(doc(db, 'properties', id), { deletedAt: new Date().toISOString(), deletedBy: profile.uid }),
+          updateDocClean(doc(db, 'properties', id), { deletedAt: new Date().toISOString(), deletedBy: profile.uid }),
         ),
       );
       void logAdminAction(profile, 'LIXEIRA (POSTO) EM MASSA', `${ids.length} posto(s) movido(s) para a Lixeira.`, undefined, 'property');
@@ -441,7 +524,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
     if (ids.length === 0) return;
     if (!window.confirm(`Restaurar ${label} da Lixeira?`)) return;
     try {
-      await Promise.all(ids.map((id) => updateDoc(doc(db, 'properties', id), { deletedAt: null, deletedBy: null })));
+      await Promise.all(
+        ids.map((id) => updateDocClean(doc(db, 'properties', id), { deletedAt: null, deletedBy: null })),
+      );
       void logAdminAction(profile, 'RESTAURAR (POSTO) EM MASSA', `${ids.length} posto(s) restaurado(s) da Lixeira.`, undefined, 'property');
       clearPropertySelection();
     } catch (err) {
@@ -716,8 +801,8 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
         {/* Header */}
         <div className="p-4 sm:p-6 border-b border-slate-800 flex items-center justify-between bg-slate-900/50">
           <div className="flex items-center gap-3">
-            <div className="p-2 bg-amber-500/20 rounded-xl">
-              <Shield className="w-6 h-6 text-amber-500" />
+            <div className="sigma-brand-frame sigma-brand-frame--sm flex h-10 w-10 flex-shrink-0 ring-1 ring-amber-500/40">
+              <img src={appLogo} alt="SIGMA-GCM" decoding="async" />
             </div>
             <div>
               <h2 className="text-xl font-bold text-white">Painel Administrativo</h2>
@@ -740,6 +825,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
             { id: 'vehicles', label: 'Viaturas', icon: Truck },
             { id: 'teams', label: 'Equipes', icon: Users },
             { id: 'reports', label: 'Relatórios', icon: FileText },
+            ...(canViewAntifraud ? [{ id: 'antifraud' as const, label: 'Antifraude', icon: AlertTriangle }] : []),
             { id: 'logs', label: 'Auditoria', icon: History },
           ].map((tab) => (
             <button
@@ -947,6 +1033,122 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
             </div>
           )}
 
+          {activeTab === 'antifraud' && canViewAntifraud && (
+            <div className="space-y-6">
+              <div>
+                <h3 className="text-lg font-bold text-white">Antifraude — rondas fora do raio</h3>
+                <p className="text-xs text-slate-400 mt-1 leading-relaxed">
+                  QR escaneado com o agente além do raio configurado no posto: o registro é salvo como irregular para auditoria.
+                  Para testar: em <span className="text-slate-300">Postos/Próprios</span> defina um raio pequeno (ex.: 15 m) no posto, afaste-se com o celular e registre a ronda pelo QR — o app avisa e o registro aparece aqui.
+                </p>
+              </div>
+              {patrolAntifraudError && (
+                <div className="bg-red-500/15 border border-red-500/40 text-red-200 rounded-2xl p-4 text-sm">
+                  <p className="font-bold mb-1">Erro ao carregar rondas</p>
+                  <p className="text-xs opacity-90">{patrolAntifraudError}</p>
+                </div>
+              )}
+              <p className="text-[11px] text-slate-500 leading-relaxed">
+                Diagnóstico: <span className="text-slate-300 font-mono">{patrolAntifraudRows.length}</span> rondas
+                carregadas • <span className="text-slate-300 font-mono">{irregularAllLoaded.length}</span> irregular(es)
+                nos dados • <span className="text-amber-400/90 font-mono">{irregularPatrolsFiltered.length}</span> no
+                período. Se o 1º for &gt;0 e o 3º for 0, ajuste &quot;Período desde&quot; para uma data mais antiga.
+              </p>
+              <div className="flex flex-wrap gap-4 items-end">
+                <label className="text-xs text-slate-400 font-bold uppercase tracking-wide">
+                  Período desde
+                  <input
+                    type="date"
+                    value={antifraudSince}
+                    onChange={(e) => setAntifraudSince(e.target.value)}
+                    className="block mt-1 px-3 py-2 bg-slate-800 border border-slate-700 rounded-xl text-white text-sm"
+                  />
+                </label>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div className="bg-amber-500/10 border border-amber-500/30 rounded-2xl p-4">
+                  <p className="text-[10px] font-black uppercase text-amber-400 tracking-wide">
+                    Total irregular (período)
+                  </p>
+                  <p className="text-2xl font-black text-white mt-1">{irregularPatrolsFiltered.length}</p>
+                </div>
+                <div className="bg-slate-800/50 border border-slate-700 rounded-2xl p-4 sm:col-span-2">
+                  <p className="text-[10px] font-black uppercase text-slate-400 mb-2 tracking-wide">
+                    Agentes com ocorrência
+                  </p>
+                  {irregularByAgent.length === 0 ? (
+                    <p className="text-sm text-slate-500">Nenhuma irregularidade no período.</p>
+                  ) : (
+                    <ul className="text-sm text-slate-200 space-y-1">
+                      {irregularByAgent.map(([agentUid, { name, count }]) => (
+                        <li key={agentUid}>
+                          <span className="font-bold text-white">{name}</span>{' '}
+                          <span className="text-amber-400">({count})</span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </div>
+              <div className="bg-slate-800/30 rounded-2xl border border-slate-800 overflow-hidden overflow-x-auto">
+                <table className="w-full min-w-[720px] text-left text-sm">
+                  <thead className="bg-slate-800/50 text-slate-400 text-xs uppercase font-bold">
+                    <tr>
+                      <th className="px-4 py-3">Data/Hora</th>
+                      <th className="px-4 py-3">Agente</th>
+                      <th className="px-4 py-3">Posto</th>
+                      <th className="px-4 py-3">Referência do posto</th>
+                      <th className="px-4 py-3">Distância / limite</th>
+                      <th className="px-4 py-3">Viatura</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800">
+                    {irregularPatrolsFiltered.length === 0 ? (
+                      <tr>
+                        <td colSpan={6} className="px-4 py-8 text-center text-slate-500 text-sm">
+                          Nenhum registro irregular neste período.
+                        </td>
+                      </tr>
+                    ) : (
+                      irregularPatrolsFiltered.map((p) => (
+                        <tr key={p.id} className="hover:bg-slate-800/40">
+                          <td className="px-4 py-3 text-slate-300 whitespace-nowrap">
+                            {(() => {
+                              try {
+                                const d = new Date(p.timestamp);
+                                return Number.isFinite(d.getTime()) ? format(d, 'dd/MM/yyyy HH:mm') : '—';
+                              } catch {
+                                return '—';
+                              }
+                            })()}
+                          </td>
+                          <td className="px-4 py-3 text-white font-medium">{p.agentName}</td>
+                          <td className="px-4 py-3 text-slate-300">{p.propertyName}</td>
+                          <td className="px-4 py-3 text-slate-400 text-xs">
+                            {p.propertyAnchorSource === 'plusCode' ? (
+                              <span className="text-emerald-400/90 font-semibold">Plus Code</span>
+                            ) : p.propertyAnchorSource === 'coordinates' ? (
+                              <span className="text-slate-300">Cadastro (lat/lng)</span>
+                            ) : (
+                              <span className="text-slate-500" title="Registro anterior ao campo propertyAnchorSource">
+                                —
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3 text-amber-400 font-bold whitespace-nowrap">
+                            {typeof p.distanceMeters === 'number' ? `${p.distanceMeters} m` : '—'} /{' '}
+                            {p.allowedRadiusMeters ?? 50} m
+                          </td>
+                          <td className="px-4 py-3 text-slate-400">{p.vehiclePrefix || p.vehicleId}</td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
           {activeTab === 'logs' && (
             <div className="space-y-4">
               <div className="flex items-center justify-between mb-4">
@@ -1099,6 +1301,11 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                                       <p className="text-[11px] text-slate-500 font-mono mt-1 break-all">
                                         {r.filename}
                                       </p>
+                                      {r.delivery === 'metadata_only' && (
+                                        <p className="text-[10px] text-amber-400/90 mt-1 font-bold uppercase tracking-wide">
+                                          Registro sem PDF no Firebase — configure Storage ou API para anexar arquivo.
+                                        </p>
+                                      )}
                                       <p className="text-[11px] text-slate-500 mt-1">
                                         Período: {format(new Date(r.windowStart), 'dd/MM HH:mm')} – {format(new Date(r.windowEnd), 'dd/MM HH:mm')}
                                       </p>
@@ -1107,11 +1314,11 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                                     <div className="flex items-center gap-2 shrink-0">
                                       <button
                                         type="button"
-                                        disabled={!r.downloadUrl}
+                                        disabled={!reportHasPdfSource(r)}
                                         onClick={async () => {
-                                          if (!r.downloadUrl) return;
+                                          if (!reportHasPdfSource(r)) return;
                                           try {
-                                            const blob = await fetchReportPdfBlob(r.id);
+                                            const blob = await resolveShiftReportPdfBlob(r);
                                             if (Capacitor.isNativePlatform()) {
                                               await sharePdfBlob(blob, r.filename, 'Relatório de Plantão');
                                             } else {
@@ -1132,9 +1339,15 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                                         }}
                                         className={[
                                           'flex items-center gap-2 px-3 py-2 text-white text-xs font-bold rounded-xl transition-colors',
-                                          r.downloadUrl ? 'bg-amber-600 hover:bg-amber-500' : 'bg-slate-700/60 opacity-60 cursor-not-allowed',
+                                          reportHasPdfSource(r)
+                                            ? 'bg-amber-600 hover:bg-amber-500'
+                                            : 'bg-slate-700/60 opacity-60 cursor-not-allowed',
                                         ].join(' ')}
-                                        title={r.downloadUrl ? 'Baixar PDF' : 'Este relatório não possui arquivo para download'}
+                                        title={
+                                          reportHasPdfSource(r)
+                                            ? 'Baixar PDF'
+                                            : 'Sem URL, Storage ou API para obter o arquivo'
+                                        }
                                       >
                                         <Download className="w-4 h-4" />
                                         Baixar
@@ -1142,11 +1355,11 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
 
                                       <button
                                         type="button"
-                                        disabled={!r.downloadUrl}
+                                        disabled={!reportHasPdfSource(r)}
                                         onClick={async () => {
-                                          if (!r.downloadUrl) return;
+                                          if (!reportHasPdfSource(r)) return;
                                           try {
-                                            const blob = await fetchReportPdfBlob(r.id);
+                                            const blob = await resolveShiftReportPdfBlob(r);
                                             if (Capacitor.isNativePlatform()) {
                                               // Em Android WebView, não há `window.print()` confiável. Compartilhar abre em apps que imprimem/visualizam PDF.
                                               await sharePdfBlob(blob, r.filename, 'Imprimir/abrir relatório');
@@ -1168,9 +1381,15 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                                         }}
                                         className={[
                                           'flex items-center gap-2 px-3 py-2 text-white text-xs font-bold rounded-xl transition-colors',
-                                          r.downloadUrl ? 'bg-slate-700 hover:bg-slate-600' : 'bg-slate-700/60 opacity-60 cursor-not-allowed',
+                                          reportHasPdfSource(r)
+                                            ? 'bg-slate-700 hover:bg-slate-600'
+                                            : 'bg-slate-700/60 opacity-60 cursor-not-allowed',
                                         ].join(' ')}
-                                        title={r.downloadUrl ? 'Imprimir' : 'Este relatório não possui arquivo para impressão'}
+                                        title={
+                                          reportHasPdfSource(r)
+                                            ? 'Imprimir'
+                                            : 'Sem fonte de PDF para abrir/imprimir'
+                                        }
                                       >
                                         <Printer className="w-4 h-4" />
                                         Imprimir
@@ -1178,21 +1397,39 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
 
                                       <button
                                         type="button"
-                                        disabled={!isMasterAdmin || !r.downloadUrl || sendingReportEmailIds.has(r.id)}
+                                        disabled={!isMasterAdmin || !reportHasPdfSource(r) || sendingReportEmailIds.has(r.id)}
                                         onClick={async () => {
-                                          if (!isMasterAdmin || !r.downloadUrl || sendingReportEmailIds.has(r.id)) return;
+                                          if (
+                                            !isMasterAdmin ||
+                                            !reportHasPdfSource(r) ||
+                                            sendingReportEmailIds.has(r.id)
+                                          )
+                                            return;
                                           try {
                                             markSendingEmail(r.id, true);
                                             const u = auth.currentUser;
                                             if (!u) throw new Error('Sessão expirada.');
                                             const token = await u.getIdToken();
-                                            const resp = await apiFetch(`/api/shift-reports/send/${encodeURIComponent(r.id)}`, {
+                                            const urlPath = `/api/shift-reports/send/${encodeURIComponent(r.id)}`;
+                                            const absolute = `${getExternalApiBaseUrl()}${urlPath}`;
+                                            console.info('[email] enviando', {
+                                              absolute,
+                                              origin: window.location.origin,
+                                            });
+                                            const resp = await apiFetchExternal(urlPath, {
                                               method: 'POST',
                                               headers: { Authorization: `Bearer ${token}` },
-                                            });
+                                            }, { retries: 2, baseDelayMs: 800, maxDelayMs: 5000 });
+                                            const payload = await resp
+                                              .json()
+                                              .catch(() => ({} as any));
                                             if (!resp.ok) {
-                                              const data = await resp.json().catch(() => ({}));
-                                              throw new Error(data?.error || `Falha ao enviar (HTTP ${resp.status})`);
+                                              console.error('[email] resposta não-ok', {
+                                                status: resp.status,
+                                                statusText: resp.statusText,
+                                                payload,
+                                              });
+                                              throw new Error(payload?.error || `Falha ao enviar (HTTP ${resp.status})`);
                                             }
                                             alert('E-mail enviado para o ADM MASTER.');
                                           } catch (e) {
@@ -1200,10 +1437,11 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                                             if (Capacitor.isNativePlatform() && isShareCanceledError(e)) return;
                                             if (Capacitor.isNativePlatform() && isShareBusyError(e)) return;
                                             const msg = e instanceof Error ? e.message : String(e);
+                                            const ext = getExternalApiBaseUrl();
                                             const base = getApiBaseUrl();
                                             const extra =
-                                              Capacitor.isNativePlatform() && msg.toLowerCase().includes('failed to fetch')
-                                                ? `\n\nDiagnóstico:\n- apiBaseUrl: ${base || '(null)'}\n- origin: ${window.location.origin}`
+                                              msg.toLowerCase().includes('failed to fetch')
+                                                ? `\n\nDiagnóstico:\n- externalApiBaseUrl: ${ext}\n- apiBaseUrl: ${base || '(null)'}\n- origin: ${window.location.origin}`
                                                 : '';
                                             alert(`Não foi possível enviar por e-mail.\n\nDetalhes: ${msg}${extra}`);
                                           } finally {
@@ -1212,15 +1450,15 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                                         }}
                                         className={[
                                           'flex items-center gap-2 px-3 py-2 text-white text-xs font-bold rounded-xl transition-colors',
-                                          isMasterAdmin && r.downloadUrl && !sendingReportEmailIds.has(r.id)
+                                          isMasterAdmin && reportHasPdfSource(r) && !sendingReportEmailIds.has(r.id)
                                             ? 'bg-slate-700 hover:bg-slate-600'
                                             : 'bg-slate-700/60 opacity-60 cursor-not-allowed',
                                         ].join(' ')}
                                         title={
                                           !isMasterAdmin
                                             ? 'Somente o ADM MASTER pode enviar por e-mail'
-                                            : r.downloadUrl
-                                              ? 'Enviar por e-mail (opcional)'
+                                            : reportHasPdfSource(r)
+                                              ? 'Enviar por e-mail (via API externa)'
                                               : 'Sem arquivo para anexar no e-mail'
                                         }
                                       >
@@ -1230,9 +1468,15 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
 
                                       <button
                                         type="button"
-                                        disabled={!isMasterAdmin}
+                                        disabled={
+                                          reportsView === 'trash'
+                                            ? !isMasterAdmin
+                                            : !canModerateShiftReports
+                                        }
                                         onClick={async () => {
-                                          if (!isMasterAdmin) return;
+                                          if (reportsView === 'trash') {
+                                            if (!isMasterAdmin) return;
+                                          } else if (!canModerateShiftReports) return;
                                           if (reportsView === 'trash') {
                                             if (!window.confirm('Excluir DEFINITIVAMENTE este relatório? Esta ação não pode ser desfeita.')) return;
                                           } else {
@@ -1242,20 +1486,26 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                                             const u = auth.currentUser;
                                             if (!u) throw new Error('Sessão expirada.');
                                             const token = await u.getIdToken();
-                                            const endpoint =
-                                              reportsView === 'trash'
-                                                ? `/api/shift-reports/purge/${encodeURIComponent(r.id)}`
-                                                : `/api/shift-reports/trash/${encodeURIComponent(r.id)}`;
-                                            const resp = await fetch(endpoint, {
-                                              method: reportsView === 'trash' ? 'DELETE' : 'POST',
-                                              headers: { Authorization: `Bearer ${token}` },
-                                            });
-                                            if (!resp.ok) {
-                                              const data = await resp.json().catch(() => ({}));
-                                              throw new Error(
-                                                data?.error ||
-                                                  `Falha ao ${reportsView === 'trash' ? 'excluir definitivamente' : 'mover para lixeira'} (HTTP ${resp.status})`,
-                                              );
+                                            if (getApiBaseUrl()) {
+                                              const endpoint =
+                                                reportsView === 'trash'
+                                                  ? `/api/shift-reports/purge/${encodeURIComponent(r.id)}`
+                                                  : `/api/shift-reports/trash/${encodeURIComponent(r.id)}`;
+                                              const resp = await apiFetch(endpoint, {
+                                                method: reportsView === 'trash' ? 'DELETE' : 'POST',
+                                                headers: { Authorization: `Bearer ${token}` },
+                                              });
+                                              if (!resp.ok) {
+                                                const data = await resp.json().catch(() => ({}));
+                                                throw new Error(
+                                                  data?.error ||
+                                                    `Falha ao ${reportsView === 'trash' ? 'excluir definitivamente' : 'mover para lixeira'} (HTTP ${resp.status})`,
+                                                );
+                                              }
+                                            } else if (reportsView === 'trash') {
+                                              await purgeShiftReportFirestore(r);
+                                            } else {
+                                              await trashShiftReportFirestore(r.id);
                                             }
                                           } catch (e) {
                                             console.error(e);
@@ -1265,13 +1515,21 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                                         }}
                                         className={[
                                           'inline-flex items-center justify-center h-10 w-10 rounded-xl transition-colors',
-                                          isMasterAdmin ? 'bg-red-600 hover:bg-red-500 text-white' : 'bg-red-600/40 text-white/70 opacity-60 cursor-not-allowed',
+                                          reportsView === 'trash'
+                                            ? isMasterAdmin
+                                              ? 'bg-red-600 hover:bg-red-500 text-white'
+                                              : 'bg-red-600/40 text-white/70 opacity-60 cursor-not-allowed'
+                                            : canModerateShiftReports
+                                              ? 'bg-red-600 hover:bg-red-500 text-white'
+                                              : 'bg-red-600/40 text-white/70 opacity-60 cursor-not-allowed',
                                         ].join(' ')}
                                         title={
-                                          !isMasterAdmin
-                                            ? 'Somente o ADM MASTER pode excluir'
-                                            : reportsView === 'trash'
-                                              ? 'Excluir definitivamente'
+                                          reportsView === 'trash'
+                                            ? !isMasterAdmin
+                                              ? 'Somente o ADM MASTER pode excluir definitivamente'
+                                              : 'Excluir definitivamente'
+                                            : !canModerateShiftReports
+                                              ? 'Somente administrador ATIVO pode mover para a lixeira'
                                               : 'Mover para lixeira'
                                         }
                                       >
@@ -1281,21 +1539,30 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                                       {reportsView === 'trash' && (
                                         <button
                                           type="button"
-                                          disabled={!isMasterAdmin}
+                                          disabled={!canModerateShiftReports}
                                           onClick={async () => {
-                                            if (!isMasterAdmin) return;
+                                            if (!canModerateShiftReports) return;
                                             if (!window.confirm('Restaurar este relatório da Lixeira?')) return;
                                             try {
                                               const u = auth.currentUser;
                                               if (!u) throw new Error('Sessão expirada.');
                                               const token = await u.getIdToken();
-                                              const resp = await apiFetch(`/api/shift-reports/restore/${encodeURIComponent(r.id)}`, {
-                                                method: 'POST',
-                                                headers: { Authorization: `Bearer ${token}` },
-                                              });
-                                              if (!resp.ok) {
-                                                const data = await resp.json().catch(() => ({}));
-                                                throw new Error(data?.error || `Falha ao restaurar (HTTP ${resp.status})`);
+                                              if (getApiBaseUrl()) {
+                                                const resp = await apiFetch(
+                                                  `/api/shift-reports/restore/${encodeURIComponent(r.id)}`,
+                                                  {
+                                                    method: 'POST',
+                                                    headers: { Authorization: `Bearer ${token}` },
+                                                  },
+                                                );
+                                                if (!resp.ok) {
+                                                  const data = await resp.json().catch(() => ({}));
+                                                  throw new Error(
+                                                    data?.error || `Falha ao restaurar (HTTP ${resp.status})`,
+                                                  );
+                                                }
+                                              } else {
+                                                await restoreShiftReportFirestore(r.id);
                                               }
                                             } catch (e) {
                                               console.error(e);
@@ -1305,9 +1572,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                                           }}
                                           className={[
                                             'flex items-center gap-2 px-3 py-2 text-xs font-bold rounded-xl transition-colors',
-                                            isMasterAdmin ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-emerald-600/40 text-white/70 opacity-60 cursor-not-allowed',
+                                            canModerateShiftReports ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-emerald-600/40 text-white/70 opacity-60 cursor-not-allowed',
                                           ].join(' ')}
-                                          title={isMasterAdmin ? 'Restaurar da lixeira' : 'Somente o ADM MASTER pode restaurar'}
+                                          title={canModerateShiftReports ? 'Restaurar da lixeira' : 'Somente administrador ATIVO pode restaurar'}
                                         >
                                           <Unlock className="w-4 h-4" />
                                           Restaurar
@@ -1704,6 +1971,28 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                   <div className="space-y-1.5">
                     <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">Plus Code</label>
                     <input name="plusCode" defaultValue={editingProperty?.plusCode} required className="w-full px-4 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-white text-sm focus:ring-2 focus:ring-amber-500 outline-none" placeholder="Ex: 87H7XQ8P+XQ" />
+                  </div>
+                  <div className="space-y-1.5">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-1">
+                      Raio antifraude GPS (m)
+                    </label>
+                    <input
+                      name="validationRadiusMeters"
+                      type="number"
+                      min={10}
+                      max={5000}
+                      step={1}
+                      defaultValue={
+                        editingProperty?.validationRadiusMeters != null
+                          ? editingProperty.validationRadiusMeters
+                          : ''
+                      }
+                      placeholder="50 (padrão se vazio)"
+                      className="w-full px-4 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-white text-sm focus:ring-2 focus:ring-amber-500 outline-none"
+                    />
+                    <p className="text-[10px] text-slate-500 leading-relaxed">
+                      Distância máxima entre o GPS do agente e o posto para marcar a ronda como válida. Acima disso grava como FORA_DO_RAIO (auditoria).
+                    </p>
                   </div>
                   <div className="pt-4 flex gap-3">
                     <button type="button" onClick={() => setShowPropertyModal(false)} className="flex-1 py-2.5 bg-slate-700 hover:bg-slate-600 text-white font-bold rounded-xl transition-colors">Cancelar</button>

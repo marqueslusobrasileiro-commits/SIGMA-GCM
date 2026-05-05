@@ -1,6 +1,6 @@
-import React, { useState, useEffect, useRef, Component } from 'react';
+import React, { useState, useEffect, useMemo, useRef, Component } from 'react';
 import { 
-  Shield, 
+  Home,
   QrCode, 
   FileText, 
   AlertTriangle, 
@@ -30,13 +30,14 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { SUPER_ADMIN_EMAIL } from './config';
-import appLogo from './assets/sigma-logo.svg';
+import appLogo from './assets/sigma-brand.png';
 import { 
   startRegistration, 
   startAuthentication 
 } from '@simplewebauthn/browser';
 import { 
   signInWithEmailAndPassword, 
+  fetchSignInMethodsForEmail,
   onAuthStateChanged, 
   signOut,
   User as FirebaseUser,
@@ -63,11 +64,14 @@ import {
   where,
   deleteDoc,
   updateDoc,
+  arrayUnion,
   Timestamp,
-  serverTimestamp
+  serverTimestamp,
+  enableNetwork,
 } from 'firebase/firestore';
 import { format, isToday, startOfDay, endOfDay } from 'date-fns';
 import { groupByDay } from './lib/groupByDay';
+import { addDocClean, limparDados, setDocClean, updateDocClean } from './lib/firestoreData';
 import { QRCodeSVG, QRCodeCanvas } from 'qrcode.react';
 import * as OpenLocationCode from 'open-location-code';
 import { 
@@ -91,14 +95,30 @@ import {
 import { auth, db, storage } from './firebase';
 import { getSecondaryAuth } from './lib/firebaseSecondary';
 import { cn } from './lib/utils';
+import { resolveOperationalTeam, fallbackTeamForPatrol } from './lib/resolveOperationalTeam';
+import { apiFetch, getApiBaseUrl } from './lib/apiClient';
+import {
+  registerShiftReportMetadataFirestore,
+  uploadShiftReportPdfToFirebase,
+} from './lib/shiftReportFirebase';
 import { generateGeminiText } from './lib/gemini';
 import { generateEndOfShiftReportPdf } from './lib/reports/endOfShiftReport';
 import { addSigmaHeader } from './lib/reports/pdfBranding';
 import { getShiftWindow } from './lib/shifts';
+import {
+  calculateDistanceMeters,
+  patrolAnchorFromProperty,
+  PATROL_GPS_ACCURACY_BLOCK_M,
+  PATROL_GPS_LOW_CONFIDENCE_M,
+  patrolEffectiveValidationStatus,
+  resolvePatrolRadiusMeters,
+} from './lib/patrolGeo';
 import { 
   UserProfile, 
   PublicProperty, 
-  PatrolRecord, 
+  PatrolRecord,
+  PatrolGpsMeta,
+  PatrolValidationStatus,
   OccurrenceRecord, 
   UserRole, 
   UserStatus, 
@@ -123,6 +143,22 @@ const isNativeApp = () => {
     return false;
   }
 };
+
+function offsetLatLngByMeters(
+  origin: { latitude: number; longitude: number },
+  deltaNorthMeters: number,
+  deltaEastMeters: number,
+): { latitude: number; longitude: number } {
+  const latRad = (origin.latitude * Math.PI) / 180;
+  const metersPerDegreeLat = 111_320;
+  const metersPerDegreeLng = 111_320 * Math.cos(latRad);
+  const dLat = deltaNorthMeters / metersPerDegreeLat;
+  const dLng = metersPerDegreeLng ? deltaEastMeters / metersPerDegreeLng : 0;
+  return {
+    latitude: origin.latitude + dLat,
+    longitude: origin.longitude + dLng,
+  };
+}
 
 const SystemManual = React.lazy(async () => {
   const mod = await import('./components/SystemManual');
@@ -202,7 +238,7 @@ async function logAdminAction(admin: UserProfile, action: string, details: strin
       targetType,
       timestamp: new Date().toISOString()
     };
-    await addDoc(collection(db, 'audit_logs'), logData);
+    await addDocClean(collection(db, 'audit_logs'), logData as unknown as Record<string, unknown>);
   } catch (err) {
     console.error("Failed to log admin action:", err);
   }
@@ -289,6 +325,7 @@ const Badge = ({ children, variant = 'info', className }: { children: React.Reac
 const TeamVehicleSetupModal = ({
   teams,
   vehicles,
+  initialVehicleId,
   onSave,
   loading: parentLoading,
   canCreateUsers,
@@ -296,6 +333,8 @@ const TeamVehicleSetupModal = ({
 }: {
   teams: Team[];
   vehicles: Vehicle[];
+  /** Viatura já ligada ao perfil — pré-seleciona se estiver na lista elegível */
+  initialVehicleId?: string | null;
   onSave: (teamData: Partial<Team>) => Promise<void>;
   loading: boolean;
   canCreateUsers: boolean;
@@ -321,6 +360,18 @@ const TeamVehicleSetupModal = ({
   const [newUserEmail, setNewUserEmail] = useState('');
   const [newUserPassword, setNewUserPassword] = useState('');
   const [newUserRole, setNewUserRole] = useState<UserRole>('agent');
+
+  /** Inclui «Em serviço», «Reserva», status ausente ou legado; exclui apenas «Em manutenção». */
+  const eligibleVehicles = useMemo(
+    () => vehicles.filter((v) => v.status !== 'Em manutenção'),
+    [vehicles],
+  );
+
+  useEffect(() => {
+    if (!initialVehicleId) return;
+    if (!eligibleVehicles.some((v) => v.id === initialVehicleId)) return;
+    setSelectedVehicleId((prev) => prev || initialVehicleId);
+  }, [initialVehicleId, eligibleVehicles]);
 
   const isLoading = parentLoading || localLoading;
   const canEditAfterVehicle = !!selectedVehicleId && !isLoading;
@@ -379,10 +430,19 @@ const TeamVehicleSetupModal = ({
               disabled={isLoading}
             >
               <option value="">Selecione uma viatura</option>
-              {vehicles.filter(v => v.status === 'Em serviço').map(v => (
-                <option key={v.id} value={v.id}>{v.prefix} - {v.model}</option>
+              {eligibleVehicles.map((v) => (
+                <option key={v.id} value={v.id}>
+                  {v.prefix} — {v.model}
+                  {v.status ? ` (${v.status})` : ''}
+                </option>
               ))}
             </select>
+            {eligibleVehicles.length === 0 && (
+              <div className="bg-red-50 border border-red-200 text-red-900 rounded-xl px-4 py-3 text-sm leading-relaxed">
+                Nenhuma viatura disponível para plantão (todas em manutenção ou ainda não cadastradas).
+                Peça ao administrador para cadastrar viaturas ou alterar o status no painel <b>Viaturas</b>.
+              </div>
+            )}
           </div>
 
           <div className="grid grid-cols-2 gap-4">
@@ -787,7 +847,7 @@ function App() {
             const isAdminEmail = u.email === SUPER_ADMIN_EMAIL;
             if (isAdminEmail && (profileData.role !== 'admin' || profileData.status !== 'ATIVO')) {
               const updatedProfile = { ...profileData, role: 'admin' as UserRole, status: 'ATIVO' as UserStatus };
-              await updateDoc(docRef, updatedProfile);
+              await updateDocClean(docRef, updatedProfile as unknown as Record<string, unknown>);
               setProfile(updatedProfile);
             } else {
               setProfile(profileData);
@@ -833,7 +893,10 @@ function App() {
 
             // Mantém o modal sincronizado com o estado real do perfil (evita "loop" de reabrir).
             setShowTeamVehicleSetup(
-              profileData.role === 'agent' && (!profileData.teamId || !profileData.vehicleId),
+              (profileData.role === 'agent' ||
+                profileData.role === 'command' ||
+                profileData.role === 'supervisor') &&
+                (!profileData.teamId || !profileData.vehicleId),
             );
           } else {
             // Usuário autenticado, mas perfil ainda não existe.
@@ -863,7 +926,7 @@ function App() {
                   createdAt: new Date().toISOString(),
                 };
 
-                await setDoc(docRef, pendingProfile, { merge: true });
+                await setDocClean(docRef, pendingProfile as unknown as Record<string, unknown>, { merge: true });
                 // Também garante via backend (Admin SDK) para não depender de rules/cache.
                 // Notificação interna (backend) para admin aprovar o cadastro.
                 // Best-effort: se falhar, não bloqueia o fluxo.
@@ -904,10 +967,45 @@ function App() {
             }
           }
           setLoading(false);
-        }, (err) => {
-          console.error("Profile listener error:", err);
+        }, async (err) => {
+          console.error('Profile listener error:', err);
+          try {
+            await enableNetwork(db);
+            await u.getIdToken(true);
+            const snap = await getDocFromServer(docRef);
+            if (snap.exists()) {
+              const profileData = snap.data() as UserProfile;
+              if (profileData.status === 'ATIVO') {
+                const isAdminEmail = u.email === SUPER_ADMIN_EMAIL;
+                if (isAdminEmail && profileData.role !== 'admin') {
+                  const updatedProfile = {
+                    ...profileData,
+                    role: 'admin' as UserRole,
+                    status: 'ATIVO' as UserStatus,
+                  };
+                  await updateDocClean(docRef, updatedProfile as unknown as Record<string, unknown>);
+                  setProfile(updatedProfile);
+                } else {
+                  setProfile(profileData);
+                }
+                setShowTeamVehicleSetup(
+                  (profileData.role === 'agent' ||
+                    profileData.role === 'command' ||
+                    profileData.role === 'supervisor') &&
+                    (!profileData.teamId || !profileData.vehicleId),
+                );
+                setError(null);
+                setLoading(false);
+                return;
+              }
+            }
+          } catch (recoverErr) {
+            console.warn('Profile recover (servidor) falhou:', recoverErr);
+          }
           setProfile(null);
-          setError('Não foi possível carregar seu perfil (permissão/rede). Tente novamente ou contate o administrador.');
+          setError(
+            'Não foi possível carregar seu perfil (permissão/rede). Feche e abra o app ou verifique a internet. Se persistir, contate o administrador.',
+          );
           setLoading(false);
         });
       } else {
@@ -937,8 +1035,7 @@ function App() {
   // Web: login Google via servidor (/api/auth/google → custom token) contorna auth/unauthorized-domain no SDK.
   // Mantém getRedirectResult só para sessões antigas que ainda usavam signInWithRedirect.
   useEffect(() => {
-    // isNativePlatform pode falhar em alguns browsers/embeds; em web sempre tentamos concluir o login via servidor.
-    if (Capacitor.getPlatform() !== 'web') return;
+    if (Capacitor.isNativePlatform()) return;
     const params = new URLSearchParams(window.location.search);
     if (params.get('google_login') === 'error') {
       setError(
@@ -949,18 +1046,45 @@ function App() {
     void (async () => {
       try {
         const completeRes = await fetch('/api/auth/google/complete', { credentials: 'include' });
-        if (completeRes.ok && completeRes.status !== 204) {
-          const data = await completeRes.json();
-          if (data?.firebaseCustomToken) {
-            await signInWithCustomToken(auth, data.firebaseCustomToken);
-            setError(null);
-            return;
-          }
+        if (completeRes.status === 204) return;
+        const data = await completeRes.json().catch(async () => {
+          const txt = await completeRes.text().catch(() => '');
+          return { error: txt || 'Resposta inválida do servidor.' };
+        });
+        if (completeRes.ok && data?.firebaseCustomToken) {
+          try {
+            const appAny = (auth as any)?.app;
+            const pid = appAny?.options?.projectId;
+            console.info("[auth] firebase web projectId:", pid);
+          } catch {}
+          await signInWithCustomToken(auth, data.firebaseCustomToken);
+          setError(null);
+          return;
+        }
+        if (!completeRes.ok) {
+          console.warn('google web auth complete: non-ok', {
+            status: completeRes.status,
+            statusText: completeRes.statusText,
+            data,
+          });
+          setError(
+            `Login Google não finalizou no servidor (HTTP ${completeRes.status}). ` +
+              `${typeof data?.error === 'string' && data.error ? `Detalhes: ${data.error}` : ''}`.trim(),
+          );
         }
       } catch (e) {
         console.warn('google web auth complete:', e);
+        const msg = e instanceof Error ? e.message : String(e);
+        setError(`Login Google não finalizou (rede/navegador). Detalhes: ${msg}`);
       }
-      // Na web o login Google é só via servidor; não chamamos getRedirectResult aqui.
+      // Na web o login Google é só via servidor; getRedirectResult do SDK costuma dar auth/unauthorized-domain se restou estado antigo.
+      if (Capacitor.getPlatform() === 'web') return;
+      try {
+        const result = await getRedirectResult(auth);
+        if (result?.user) setError(null);
+      } catch (err: unknown) {
+        console.warn('getRedirectResult error:', err);
+      }
     })();
   }, []);
 
@@ -974,7 +1098,8 @@ function App() {
     const qPatrols =
       profile?.role === 'agent'
         ? query(collection(db, 'patrols'), where('agentId', '==', profile.uid), limit(200))
-        : query(collection(db, 'patrols'), orderBy('timestamp', 'desc'));
+        : /* Limit evita sincronizar milhares de docs no APK (lento + lista “sumindo”). */
+          query(collection(db, 'patrols'), orderBy('timestamp', 'desc'), limit(400));
     const unsubPatrols = onSnapshot(qPatrols, (snap) => {
       const items = snap.docs.map(d => {
         const data = d.data();
@@ -1092,7 +1217,10 @@ function App() {
         };
 
         try {
-          await setDoc(doc(db, 'vehicle_locations', profile.vehicleId!), locationData);
+          await setDocClean(
+            doc(db, 'vehicle_locations', profile.vehicleId!),
+            locationData as unknown as Record<string, unknown>,
+          );
           
           // Check Geofences
           geofences.forEach(async (fence) => {
@@ -1117,13 +1245,13 @@ function App() {
     if (activeTab === 'map' && profile) {
       const logAccess = async () => {
         try {
-          await addDoc(collection(db, 'logs'), {
+          await addDocClean(collection(db, 'logs'), {
             type: 'MAP_ACCESS',
             userId: user?.uid,
             userName: profile.name,
             userRole: profile.role,
             timestamp: serverTimestamp(),
-            details: 'Visualização do mapa tático operacional'
+            details: 'Visualização do mapa tático operacional',
           });
           // console.log(`[LOG] Map accessed by ${profile.name} (${profile.role})`);
         } catch (err) {
@@ -1173,7 +1301,7 @@ function App() {
 
         try {
           for (const fence of initialGeofences) {
-            await addDoc(collection(db, 'geofences'), fence);
+            await addDocClean(collection(db, 'geofences'), fence as unknown as Record<string, unknown>);
           }
         } catch (err) {
           console.error("Error bootstrapping geofences:", err);
@@ -1199,16 +1327,15 @@ function App() {
         generateGeminiText,
       });
 
-      // Evita duplicar o mesmo relatório do mesmo plantão sem precisar "ler" a coleção (rules do agente).
-      // Usamos um ID determinístico: agentId_teamId_windowStart(yyyyMMddTHHmm)
-      const reportId =
-        profile.role === 'agent' && profile.teamId
-          ? `${profile.uid}_${profile.teamId}_${windowStart.replace(/[:.]/g, '-')}`
-          : undefined;
+      const teamResolved = teams.find((t) => t.id === profile.teamId);
 
       const sendToServerAndRegister = async () => {
         if (!user) throw new Error('Sessão expirada.');
         const idToken = await user.getIdToken();
+        const reportId =
+          profile.teamId?.trim()
+            ? `${profile.uid}_${profile.teamId.trim()}_${windowStart.replace(/[:.]/g, '-')}`
+            : `${profile.uid}_noteam_${windowStart.replace(/[:.]/g, '-')}`;
         const base64 = await new Promise<string>((resolve, reject) => {
           const reader = new FileReader();
           reader.onload = () => {
@@ -1224,8 +1351,7 @@ function App() {
           reader.readAsDataURL(blob);
         });
 
-        const team = teams.find((t) => t.id === profile.teamId);
-        const resp = await fetch('/api/shift-reports/upload', {
+        const resp = await apiFetch('/api/shift-reports/upload', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -1239,8 +1365,8 @@ function App() {
               agentName: profile.name,
               registration: profile.registration,
               teamId: profile.teamId,
-              teamName: team?.name || '',
-              vehiclePrefix: team?.vehiclePrefix || '',
+              teamName: teamResolved?.name || '',
+              vehiclePrefix: teamResolved?.vehiclePrefix || '',
               shift,
               windowStart,
               windowEnd,
@@ -1252,16 +1378,82 @@ function App() {
           const data = await resp.json().catch(() => ({}));
           throw new Error(data?.error || `Falha ao enviar para o servidor (HTTP ${resp.status})`);
         }
-        const data = (await resp.json().catch(() => ({}))) as { downloadUrl?: string; reportId?: string };
-        // O servidor já registra em `shift_reports` com `localPath`.
-        // Evita escrever pelo cliente para não sobrescrever campos do servidor (ex.: `localPath`).
-        void data;
+        void (await resp.json().catch(() => ({})));
       };
 
-      // Envio obrigatório ao Painel ADM (não depende do Firebase Storage).
       try {
-        await sendToServerAndRegister();
-        alert('Relatório gerado e enviado automaticamente ao Painel do ADM!');
+        const apiBase = getApiBaseUrl();
+        let usedFirebase = false;
+        let metadataOnly = false;
+        if (apiBase) {
+          try {
+            await sendToServerAndRegister();
+          } catch (apiErr) {
+            console.warn('[shift-report] API falhou; tentando Firebase direto:', apiErr);
+            try {
+              await uploadShiftReportPdfToFirebase({
+                profile,
+                blob,
+                filename,
+                windowStart,
+                windowEnd,
+                shift,
+                team: teamResolved,
+              });
+              usedFirebase = true;
+            } catch (storageErr) {
+              console.warn(
+                '[shift-report] Storage falhou; gravando só metadados no Firestore:',
+                storageErr,
+              );
+              await registerShiftReportMetadataFirestore({
+                profile,
+                filename,
+                windowStart,
+                windowEnd,
+                shift,
+                team: teamResolved,
+              });
+              usedFirebase = true;
+              metadataOnly = true;
+            }
+          }
+        } else {
+          try {
+            await uploadShiftReportPdfToFirebase({
+              profile,
+              blob,
+              filename,
+              windowStart,
+              windowEnd,
+              shift,
+              team: teamResolved,
+            });
+            usedFirebase = true;
+          } catch (storageErr) {
+            console.warn(
+              '[shift-report] Storage falhou (ex.: plano Spark); gravando só metadados:',
+              storageErr,
+            );
+            await registerShiftReportMetadataFirestore({
+              profile,
+              filename,
+              windowStart,
+              windowEnd,
+              shift,
+              team: teamResolved,
+            });
+            usedFirebase = true;
+            metadataOnly = true;
+          }
+        }
+        alert(
+          metadataOnly
+            ? 'Plantão registrado no Painel (somente dados — sem PDF no Firebase).\n\nBaixar/Imprimir só funcionará com Storage (Blaze) ou API configurada (VITE_API_BASE_URL).'
+            : usedFirebase
+              ? 'Relatório gerado e registrado no Firebase (Painel → Relatórios).'
+              : 'Relatório gerado e enviado automaticamente ao Painel do ADM!',
+        );
       } catch (sendErr) {
         console.error('Falha ao enviar relatório para o Painel do ADM:', sendErr);
         const msg =
@@ -1271,8 +1463,8 @@ function App() {
               ? sendErr
               : JSON.stringify(sendErr);
         alert(
-          'Relatório PDF foi gerado, mas falhou ao ENVIAR automaticamente para o ADM.\n\n' +
-            'Verifique se o servidor está rodando e se o usuário está autenticado.\n\n' +
+          'Relatório PDF foi gerado, mas falhou ao registrar no sistema.\n\n' +
+            'No APK: verifique internet e permissões do Storage/Firestore.\n\n' +
             `Detalhes: ${msg}`,
         );
         throw sendErr;
@@ -1288,10 +1480,10 @@ function App() {
   const handleResolveAlert = async (alertId: string) => {
     if (!profile) return;
     try {
-      await updateDoc(doc(db, 'alerts', alertId), {
+      await updateDocClean(doc(db, 'alerts', alertId), {
         resolved: true,
         resolvedBy: profile.name,
-        resolvedAt: new Date().toISOString()
+        resolvedAt: new Date().toISOString(),
       });
       await logAdminAction(profile, 'RESOLVE_ALERT', `Alerta ${alertId} resolvido`, alertId, 'alert');
     } catch (err) {
@@ -1305,9 +1497,9 @@ function App() {
       const newAlert: Omit<OperationalAlert, 'id'> = {
         ...alertData,
         resolved: false,
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
       };
-      await addDoc(collection(db, 'alerts'), newAlert);
+      await addDocClean(collection(db, 'alerts'), newAlert as unknown as Record<string, unknown>);
       await logAdminAction(profile, 'TRIGGER_ALERT', `Alerta manual emitido: ${alertData.title}`, undefined, 'alert');
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, 'alerts');
@@ -1373,7 +1565,7 @@ function App() {
           // Sempre salvar no Firestore imediatamente após o Auth.
           // IMPORTANTE: não sobrescrever o schema do app (role/status/createdAt),
           // senão o painel e o RBAC podem parar de funcionar.
-          await setDoc(
+          await setDocClean(
             docRef,
             {
               ...profileData,
@@ -1511,7 +1703,7 @@ function App() {
               failedAttempts: 0,
               createdAt: new Date().toISOString(),
             };
-            await setDoc(docRef, pendingProfile, { merge: true });
+            await setDocClean(docRef, pendingProfile as unknown as Record<string, unknown>, { merge: true });
           }
 
           // Notifica admin (best-effort)
@@ -1556,13 +1748,43 @@ function App() {
         }
       }
 
+      // Conta criada só com Google: e-mail/senha nunca vai funcionar até criar senha no Firebase ou usar Google.
+      if (
+        code === 'auth/invalid-credential' ||
+        code === 'auth/wrong-password' ||
+        code === 'auth/user-not-found'
+      ) {
+        try {
+          const methods = await fetchSignInMethodsForEmail(auth, email);
+          if (methods.includes('google.com') && !methods.includes('password')) {
+            setError(
+              'Este e-mail está vinculado ao Google. Use «Entrar com Google» neste aparelho (ou peça ao administrador para adicionar login por senha no Firebase).',
+            );
+            setLoading(false);
+            return;
+          }
+          if (
+            methods.length === 0 &&
+            (code === 'auth/user-not-found' || code === 'auth/invalid-credential')
+          ) {
+            setError(
+              'Não há conta com este e-mail ou a proteção anti-enumeração ocultou os métodos. Tente «Entrar com Google» ou confira o e-mail digitado.',
+            );
+            setLoading(false);
+            return;
+          }
+        } catch {
+          /* fetchSignInMethods pode falhar com proteção do projeto */
+        }
+      }
+
       const msg =
         code === 'auth/user-disabled'
           ? 'Sua conta está bloqueada/desativada no sistema. Peça ao administrador para desbloquear.'
           : code === 'auth/invalid-credential' || code === 'auth/wrong-password'
-            ? 'E-mail ou senha inválidos. Verifique se digitou corretamente (sem espaços) e tente novamente.'
+            ? 'E-mail ou senha incorretos. Se você costuma entrar com Google, use «Entrar com Google». Confira também CAPS LOCK e espaços.'
           : code === 'auth/user-not-found'
-            ? 'Usuário não encontrado.'
+            ? 'Nenhuma conta encontrada com este e-mail. Cadastre-se, use Google ou confira o endereço.'
             : code === 'auth/invalid-email'
               ? 'E-mail inválido.'
               : code === 'auth/email-already-in-use'
@@ -1570,7 +1792,7 @@ function App() {
                 : code === 'auth/weak-password'
                   ? 'Senha fraca (mínimo 6 caracteres).'
                   : code === 'auth/operation-not-allowed'
-                    ? 'Método de login/cadastro desabilitado no Firebase Auth.'
+                    ? 'Login por e-mail/senha está desativado no projeto Firebase. No Console → Authentication → Sign-in method, ative «E-mail/senha». Quem só tem conta Google deve usar «Entrar com Google».'
                     : (err?.message || code)
                       ? `Falha no login/cadastro: ${code || err.message}`
                       : 'Erro no processo. Verifique os dados ou se a conta está bloqueada.';
@@ -1754,7 +1976,7 @@ function App() {
           throw new Error('Não foi possível validar a biometria neste aparelho.');
         }
 
-        await updateDoc(doc(db, 'users', profile.uid), { biometricEnabled: true });
+        await updateDocClean(doc(db, 'users', profile.uid), { biometricEnabled: true });
         setProfile({ ...profile, biometricEnabled: true });
         alert('Biometria habilitada com sucesso neste dispositivo!');
         return;
@@ -1821,7 +2043,7 @@ function App() {
       }
 
       const docRef = doc(db, 'users', user.uid);
-      await setDoc(docRef, profileData, { merge: true });
+      await setDocClean(docRef, profileData as unknown as Record<string, unknown>, { merge: true });
 
       if (!isAdminEmail) {
         // Notificação interna (backend) para admin aprovar o cadastro.
@@ -1956,7 +2178,7 @@ function App() {
       setPhotoLoadingStep('FIRESTORE_UPDATE');
       const path = 'users';
       await withTimeout(
-        updateDoc(doc(db, path, profile.uid), { photoUrl, photoVersion: version }),
+        updateDocClean(doc(db, path, profile.uid), { photoUrl, photoVersion: version }),
         20_000,
         'FIRESTORE_UPDATE',
       );
@@ -2058,7 +2280,7 @@ function App() {
       const photoUrl = user.photoURL;
       const path = 'users';
       const version = Date.now();
-      await updateDoc(doc(db, path, profile.uid), { photoUrl, photoVersion: version });
+      await updateDocClean(doc(db, path, profile.uid), { photoUrl, photoVersion: version });
       setProfile({ ...profile, photoUrl, photoVersion: version });
       alert('Foto sincronizada com o Google!');
     } catch (err) {
@@ -2108,21 +2330,6 @@ function App() {
     await signOut(auth);
   };
 
-  const calculateDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
-    const R = 6371e3; // Earth radius in meters
-    const φ1 = lat1 * Math.PI / 180;
-    const φ2 = lat2 * Math.PI / 180;
-    const Δφ = (lat2 - lat1) * Math.PI / 180;
-    const Δλ = (lon2 - lon1) * Math.PI / 180;
-
-    const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
-              Math.cos(φ1) * Math.cos(φ2) *
-              Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
-    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-
-    return R * c; // in meters
-  };
-
   const handleDeleteProperty = (id: string, name: string) => {
     setPropertyToDelete({ id, name });
     setShowDeleteConfirmModal(true);
@@ -2150,25 +2357,82 @@ function App() {
   };
 
   const handleUpdateTeam = async () => {
-    if (!user || !profile || !profile.teamId) return;
+    if (!user || !profile) return;
+    if (profile.role === 'admin') {
+      alert(
+        'Contas administrativas não utilizam plantão/equipe neste painel. Gerencie equipes pelo Painel Administrativo.',
+      );
+      setIsEditingTeam(false);
+      return;
+    }
     setLoading(true);
     try {
-      const teamRef = doc(db, 'teams', profile.teamId);
+      const teamResolved = await resolveOperationalTeam(
+        db,
+        user.uid,
+        profile.teamId,
+        teams,
+      );
+      if (!teamResolved) {
+        alert(
+          'Não foi possível localizar sua equipe (rede ou vínculo no sistema). Verifique a internet, abra Configurar plantão ou peça ao administrador para conferir seu vínculo em Equipes.',
+        );
+        return;
+      }
+
+      const prevTid = profile.teamId?.trim() ?? "";
+      if (!prevTid || teamResolved.id !== prevTid) {
+        try {
+          await setDocClean(doc(db, 'users', user.uid), { teamId: teamResolved.id }, { merge: true });
+          setProfile((prev) => (prev ? { ...prev, teamId: teamResolved.id } : prev));
+          setTeamId(teamResolved.id);
+        } catch (e) {
+          console.warn('[plantão] ajuste de teamId no perfil:', e);
+        }
+      }
+
+      const teamRef = doc(db, 'teams', teamResolved.id);
+      let agentIds = teamResolved.agentIds;
+      try {
+        const fresh = await getDocFromServer(teamRef);
+        if (fresh.exists()) {
+          agentIds = (fresh.data().agentIds as string[] | undefined) ?? agentIds;
+        }
+      } catch {
+        /* usa agentIds já resolvidos */
+      }
+      if (!agentIds?.includes(user.uid)) {
+        await updateDocClean(teamRef, { agentIds: arrayUnion(user.uid) });
+      }
+
       const updatedData = {
         name: editTeamName,
         vehiclePrefix: editVehiclePrefix,
         driver: editDriver,
         inCharge: editInCharge,
         aux1: editAux1,
-        aux2: editAux2
+        aux2: editAux2,
       };
-      
-      await updateDoc(teamRef, updatedData);
+
+      await updateDocClean(teamRef, updatedData as unknown as Record<string, unknown>);
       setIsEditingTeam(false);
       alert('Dados do plantão atualizados com sucesso!');
-    } catch (err) {
-      console.error("Error updating team:", err);
-      handleFirestoreError(err, OperationType.UPDATE, 'teams');
+    } catch (err: unknown) {
+      console.error('Error updating team:', err);
+      const fe = err as { code?: string; message?: string };
+      const code = fe?.code || '';
+      const msg = err instanceof Error ? err.message : String(err);
+      if (code === 'permission-denied' || msg.toLowerCase().includes('permission')) {
+        alert(
+          'Sem permissão para salvar esta equipe. Confira no Firebase se as regras foram publicadas (deploy) e se seu perfil tem o campo teamId correto.',
+        );
+      } else if (code === 'not-found' || msg.includes('No document to update')) {
+        alert('Equipe não encontrada. Configure o plantão novamente no perfil.');
+      } else if (code === 'unavailable' || msg.includes('offline')) {
+        alert('Serviço temporariamente indisponível ou sem internet. Tente novamente.');
+      } else {
+        alert(`Erro ao salvar o plantão (${code || 'desconhecido'}). Se persistir, avise o administrador.`);
+      }
     } finally {
       setLoading(false);
     }
@@ -2179,11 +2443,11 @@ function App() {
     setSetupTeamVehicleSaving(true);
     try {
       // Create a new team entry for this shift
-      const teamRef = await addDoc(collection(db, 'teams'), {
+      const teamRef = await addDocClean(collection(db, 'teams'), {
         ...teamData,
         agentIds: [user.uid],
         createdAt: new Date().toISOString(),
-        active: true
+        active: true,
       });
 
       const userRef = doc(db, 'users', user.uid);
@@ -2193,13 +2457,17 @@ function App() {
       };
       
       // `setDoc(merge)` evita falha caso o doc ainda não exista (updateDoc falha).
-      await setDoc(userRef, updatedData, { merge: true });
+      await setDocClean(userRef, updatedData as unknown as Record<string, unknown>, { merge: true });
       
       // Update local profile immediately to avoid waiting for snapshot
       setProfile((prev) => (prev ? { ...prev, ...updatedData } : prev));
       setTeamId(teamRef.id);
       setVehicleId(teamData.vehicleId || '');
-      
+
+      void getDocFromServer(doc(db, 'teams', teamRef.id)).catch(() => {
+        /* aquece cache servidor no APK após criar plantão */
+      });
+
       setShowTeamVehicleSetup(false);
       alert('Plantão configurado com sucesso!');
     } catch (err) {
@@ -2238,7 +2506,7 @@ function App() {
         createdAt: new Date().toISOString(),
       };
 
-      await setDoc(doc(db, 'users', cred.user.uid), profileData, { merge: true });
+      await setDocClean(doc(db, 'users', cred.user.uid), profileData as unknown as Record<string, unknown>, { merge: true });
       // Garante que não fica “logado” no auth secundário.
       await signOut(secondaryAuth);
       return;
@@ -2275,6 +2543,8 @@ function App() {
   };
 
   const [patrolMessage, setPatrolMessage] = useState<string>('');
+  /** Não usar `loading` global na ronda — senão o APK inteiro vira “Carregando sistema…” por vários segundos. */
+  const [patrolFlowBusy, setPatrolFlowBusy] = useState(false);
 
   const handleScan = (qrCode: string) => {
     // console.log("QR Code Scanned:", qrCode);
@@ -2320,7 +2590,8 @@ function App() {
     // Em seguida, executa a ronda com posição simulada = coordenadas do próprio ponto (distância 0m).
     // Usamos um pequeno delay para garantir que o state foi aplicado.
     setTimeout(() => {
-      void confirmPatrol({ latitude: property.latitude, longitude: property.longitude }, property);
+      const a = patrolAnchorFromProperty(property);
+      void confirmPatrol({ latitude: a.latitude, longitude: a.longitude }, property);
     }, 50);
   };
 
@@ -2358,8 +2629,10 @@ function App() {
     if (simulatedPos) {
       // console.log("Using simulated position:", simulatedPos);
       setPatrolMessage("Processando localização simulada...");
-      setLoading(true);
-      await processPatrol(selectedProperty, simulatedPos.latitude, simulatedPos.longitude);
+      setPatrolFlowBusy(true);
+      await processPatrol(selectedProperty, simulatedPos.latitude, simulatedPos.longitude, {
+        simulatedLocation: true,
+      });
       return;
     }
 
@@ -2369,7 +2642,7 @@ function App() {
       return;
     }
     
-    setLoading(true);
+    setPatrolFlowBusy(true);
     setPatrolMessage("Solicitando GPS...");
     // console.log("Requesting GPS for property:", scannedProperty.name);
 
@@ -2380,9 +2653,11 @@ function App() {
     };
 
     navigator.geolocation.getCurrentPosition(async (pos) => {
-      const { latitude, longitude } = pos.coords;
+      const { latitude, longitude, accuracy } = pos.coords;
       setPatrolMessage("GPS Recebido. Validando...");
-      await processPatrol(selectedProperty, latitude, longitude);
+      await processPatrol(selectedProperty, latitude, longitude, {
+        accuracyMeters: typeof accuracy === 'number' && Number.isFinite(accuracy) ? accuracy : null,
+      });
     }, (err) => {
       console.error("GPS Error:", err);
       let msg = 'Erro ao obter localização GPS.';
@@ -2392,22 +2667,47 @@ function App() {
       
       setPatrolMessage("");
       alert(`${msg} (Erro: ${err.message})`);
-      setLoading(false);
+      setPatrolFlowBusy(false);
     }, geoOptions);
   };
 
-  const processPatrol = async (property: PublicProperty, latitude: number, longitude: number) => {
+  const processPatrol = async (
+    property: PublicProperty,
+    latitude: number,
+    longitude: number,
+    gpsMeta?: PatrolGpsMeta,
+  ) => {
     try {
-      // console.log("Starting processPatrol with coordinates:", { latitude, longitude });
-      
-      if (!profile || !profile.teamId) {
-        throw new Error("Perfil ou equipe não identificados. Verifique seu plantão.");
+      const profileTeamId = profile?.teamId?.trim();
+      if (!profile) {
+        throw new Error("Perfil não carregado. Faça login novamente.");
       }
 
-      const distance = calculateDistance(latitude, longitude, property.latitude, property.longitude);
-      // console.log(`Distance to property "${property.name}": ${distance.toFixed(2)}m`);
+      const simulated = !!gpsMeta?.simulatedLocation;
+      const accRaw = gpsMeta?.accuracyMeters;
+      const acc = typeof accRaw === 'number' && Number.isFinite(accRaw) ? accRaw : null;
 
-      // Generate Plus Code for current location
+      if (!simulated && acc != null && acc > PATROL_GPS_ACCURACY_BLOCK_M) {
+        setPatrolMessage('');
+        setPatrolFlowBusy(false);
+        alert(
+          `GPS impreciso demais (±${Math.round(acc)} m). Limite para registrar: ±${PATROL_GPS_ACCURACY_BLOCK_M} m. Aguarde melhor sinal ou vá a área aberta.`,
+        );
+        return;
+      }
+
+      const allowedRadius = resolvePatrolRadiusMeters(property);
+      const anchor = patrolAnchorFromProperty(property);
+      const distance = calculateDistanceMeters(
+        latitude,
+        longitude,
+        anchor.latitude,
+        anchor.longitude,
+      );
+      const validationStatus: PatrolValidationStatus =
+        distance <= allowedRadius ? 'VALIDO' : 'FORA_DO_RAIO';
+      const gpsLowConfidence = !simulated && acc != null && acc > PATROL_GPS_LOW_CONFIDENCE_M;
+
       let currentPlusCode = 'N/A';
       try {
         // @ts-ignore
@@ -2418,27 +2718,100 @@ function App() {
         console.warn("Plus Code generation failed, continuing without it:", olcErr);
       }
 
-      // GPS Validation (50 meters limit)
-      if (distance > 50) {
-        console.warn("GPS validation failed. Distance:", distance);
-        setPatrolMessage("");
-        setLoading(false);
-        alert(`Validação GPS falhou! Você está a ${Math.round(distance)}m do local. O limite de segurança é 50m. Aproxime-se do ponto de ronda.`);
-        return;
+      setPatrolMessage("Salvando registro no sistema...");
+
+      const tidNorm = profile.teamId?.trim() ?? '';
+      /** 1) Cache React (instantâneo — evita travar no desktop se o listener já trouxe a equipe). */
+      let team: Team | null = tidNorm
+        ? teams.find((t) => t.id === tidNorm) ?? null
+        : null;
+
+      /** 2) Resolver via Firestore com teto de tempo — getDocs sem resposta pode pendurar a UI indefinidamente. */
+      const PATROL_TEAM_RESOLVE_MS = 12000;
+      if (!team) {
+        try {
+          team = await Promise.race([
+            resolveOperationalTeam(db, profile.uid, profile.teamId?.trim(), teams),
+            new Promise<null>((resolve) => {
+              window.setTimeout(() => {
+                console.warn(
+                  '[patrol] resolução de equipe excedeu',
+                  PATROL_TEAM_RESOLVE_MS,
+                  'ms; usando fallbacks.',
+                );
+                resolve(null);
+              }, PATROL_TEAM_RESOLVE_MS);
+            }),
+          ]);
+        } catch {
+          team = null;
+        }
       }
 
-      setPatrolMessage("Salvando registro no sistema...");
-      
-      const team = teams.find(t => t.id === profile.teamId);
+      if (!team && tidNorm) {
+        try {
+          const ref = doc(db, 'teams', tidNorm);
+          const snap = await getDoc(ref);
+          if (snap.exists()) {
+            team = { id: snap.id, ...snap.data() } as Team;
+          }
+        } catch (e) {
+          console.warn('[patrol] último getDoc da equipe:', e);
+        }
+      }
+
+      let usedPatrolTeamFallback = false;
+      if (!team && tidNorm) {
+        console.warn(
+          '[patrol] equipe não carregada do servidor; usando dados mínimos do perfil. teamId:',
+          tidNorm,
+        );
+        team = fallbackTeamForPatrol(profile, tidNorm);
+        usedPatrolTeamFallback = true;
+      }
+
       if (!team) {
-        console.error("Team not found in local state. TeamId:", profile.teamId);
-        throw new Error("Sua equipe atual não foi encontrada. Tente reconfigurar seu plantão no perfil.");
+        console.error("Team not resolved. profile.teamId:", profile.teamId);
+        throw new Error(
+          "Sem equipe vinculada ao perfil (teamId). Abra o plantão e salve viatura + equipe, ou peça ao administrador para corrigir seu cadastro.",
+        );
+      }
+
+      if (!profileTeamId || team.id !== profileTeamId) {
+        try {
+          await setDocClean(doc(db, "users", profile.uid), { teamId: team.id }, { merge: true });
+          setProfile((prev) => (prev ? { ...prev, teamId: team.id } : prev));
+          setTeamId(team.id);
+        } catch (e) {
+          console.warn("[patrol] sincronizar teamId no perfil:", e);
+        }
+      }
+
+      const effectiveTeamId = team.id;
+
+      let baseObservation = usedPatrolTeamFallback
+        ? 'Ronda via QR Code. Detalhes do plantão não foram lidos do servidor — confira teamId e documento da equipe no Firebase.'
+        : 'Ronda realizada com sucesso via QR Code.';
+      const obsParts: string[] = [];
+      if (validationStatus === 'FORA_DO_RAIO') {
+        obsParts.push(
+          `VALIDAÇÃO ANTIFRAUDE: FORA_DO_RAIO (~${Math.round(distance)} m do posto; permitido ${allowedRadius} m).`,
+        );
+      }
+      if (gpsLowConfidence && acc != null) {
+        obsParts.push(`GPS com baixa confiança (precisão ±${Math.round(acc)} m).`);
+      }
+      if (simulated) {
+        obsParts.push('Localização simulada (teste).');
+      }
+      if (obsParts.length) {
+        baseObservation = `${baseObservation} ${obsParts.join(' ')}`;
       }
 
       const patrolData: Omit<PatrolRecord, 'id'> = {
         agentId: profile.uid,
         agentName: profile.name,
-        teamId: profile.teamId,
+        teamId: effectiveTeamId,
         teamName: team.name || 'Equipe sem nome',
         vehicleId: profile.vehicleId || '',
         vehiclePrefix: team.vehiclePrefix || 'N/A',
@@ -2452,29 +2825,101 @@ function App() {
         timestamp: new Date().toISOString(),
         latitude,
         longitude,
-        status: 'normal',
-        observation: 'Ronda realizada com sucesso via QR Code.'
+        propertyLatitude: anchor.latitude,
+        propertyLongitude: anchor.longitude,
+        propertyAnchorSource: anchor.source,
+        distanceMeters: Math.round(distance),
+        allowedRadiusMeters: allowedRadius,
+        validationStatus,
+        gpsAccuracyMeters: acc ?? null,
+        gpsLowConfidence: gpsLowConfidence ?? false,
+        simulatedLocation: simulated ?? false,
+        mockLocationSuspected: false,
+        status: validationStatus === 'FORA_DO_RAIO' ? 'attention' : 'normal',
+        observation: baseObservation,
       };
 
       // console.log("Attempting to save patrolData:", patrolData);
       const path = 'patrols';
       
       try {
-        await addDoc(collection(db, path), patrolData);
-        // console.log("Patrol record saved successfully to Firestore.");
-        
+        const docRef = await Promise.race([
+          addDocClean(collection(db, path), patrolData as unknown as Record<string, unknown>),
+          new Promise<never>((_, reject) => {
+            window.setTimeout(() => {
+              reject(new Error('Tempo esgotado ao salvar a ronda. Verifique a rede e tente de novo.'));
+            }, 28_000);
+          }),
+        ]);
+        const newRecord = { id: docRef.id, ...patrolData } as PatrolRecord;
+        setPatrols((prev) => {
+          const filtered = prev.filter((p) => p.id !== docRef.id);
+          const merged = [newRecord, ...filtered];
+          merged.sort((a, b) => {
+            const ta = new Date(a.timestamp).getTime();
+            const tb = new Date(b.timestamp).getTime();
+            return (Number.isFinite(tb) ? tb : 0) - (Number.isFinite(ta) ? ta : 0);
+          });
+          return merged;
+        });
+
         setPatrolMessage("Sucesso!");
-        // Close modal first for better UX
         const propName = property.name;
         setScannedProperty(null);
-        
-        // Then notify
-        setTimeout(() => {
-          alert(`Ronda registrada com sucesso em: ${propName}`);
-        }, 100);
-      } catch (dbErr) {
-        console.error("Firestore addDoc error:", dbErr);
-        handleFirestoreError(dbErr, OperationType.CREATE, path);
+
+        if (validationStatus === 'FORA_DO_RAIO') {
+          alert(
+            'ATENÇÃO: Você está fora da área do posto.\n\nO registro foi salvo para auditoria antifraude e aparecerá no Painel Administrativo.',
+          );
+          try {
+            await addDocClean(collection(db, 'alerts'), {
+              type: 'security',
+              severity: 'high',
+              title: 'Ronda fora do raio do posto',
+              message: `${profile.name} • ${team.vehiclePrefix || 'VTR'} • ${property.name} • ~${Math.round(distance)} m (limite ${allowedRadius} m)`,
+              timestamp: new Date().toISOString(),
+              targetId: property.id,
+              targetName: property.name,
+              resolved: false,
+            });
+          } catch (ae) {
+            console.warn('[patrol] alerta operacional:', ae);
+          }
+          try {
+            await addDocClean(collection(db, 'audit_logs'), {
+              adminId: profile.uid,
+              adminName: profile.name,
+              action: 'RONDA_FORA_DO_RAIO',
+              details: `Posto: ${property.name} (${property.id}). Distância ~${Math.round(distance)} m. Raio ${allowedRadius} m. PatrolId: ${docRef.id}`,
+              targetId: docRef.id,
+              targetType: 'patrol',
+              timestamp: new Date().toISOString(),
+            });
+          } catch (le) {
+            console.warn('[patrol] auditoria antifraude:', le);
+          }
+        } else {
+          setTimeout(() => {
+            let msg = `Ronda registrada com sucesso em: ${propName}`;
+            if (gpsLowConfidence && acc != null) {
+              msg += `\n\nAviso: precisão do GPS ±${Math.round(acc)} m (ideal ≤ ${PATROL_GPS_LOW_CONFIDENCE_M} m).`;
+            }
+            alert(msg);
+          }, 100);
+        }
+      } catch (dbErr: unknown) {
+        console.error('Firestore addDoc error:', dbErr);
+        const code =
+          typeof dbErr === 'object' && dbErr !== null && 'code' in dbErr
+            ? String((dbErr as { code?: string }).code)
+            : '';
+        let friendly =
+          dbErr instanceof Error ? dbErr.message : typeof dbErr === 'string' ? dbErr : JSON.stringify(dbErr);
+        if (code === 'permission-denied') {
+          friendly =
+            'Permissão negada. No Firebase, seu usuário precisa estar com status ATIVO e cadastro em users/{uid}. Peça ao administrador para conferir o perfil.';
+        }
+        alert(`Erro ao salvar ronda: ${friendly}`);
       }
       
     } catch (err: any) {
@@ -2482,7 +2927,7 @@ function App() {
       alert(`Erro ao registrar ronda: ${err.message || 'Erro interno do sistema'}`);
     } finally {
       setPatrolMessage("");
-      setLoading(false);
+      setPatrolFlowBusy(false);
     }
   };
 
@@ -2550,7 +2995,9 @@ function App() {
   if (loading) {
     return (
       <div className="min-h-dvh bg-blue-900 flex flex-col items-center justify-center text-white p-6 safe-pt safe-pb">
-        <Shield className="w-16 h-16 animate-pulse mb-4" />
+        <div className="sigma-brand-frame mx-auto mb-4 aspect-square w-36 max-w-[85vw] shrink-0 animate-pulse shadow-xl ring-2 ring-white/25">
+          <img src={appLogo} alt="" decoding="async" />
+        </div>
         <h1 className="text-2xl font-bold tracking-widest">SIGMA-GCM</h1>
         <p className="text-blue-200 mt-2">Carregando sistema...</p>
       </div>
@@ -2567,14 +3014,8 @@ function App() {
           className="w-full max-w-md"
         >
           <div className="text-center mb-8">
-            <div className="mx-auto h-24 w-24 rounded-2xl overflow-hidden shadow-xl mb-4 bg-blue-900">
-              <img
-                src={appLogo}
-                alt="SIGMA-GCM"
-                className="h-full w-full object-cover"
-                loading="eager"
-                decoding="async"
-              />
+            <div className="sigma-brand-frame mx-auto mb-4 aspect-square w-full max-w-[min(240px,88vw)] shadow-xl ring-2 ring-black/[0.08]">
+              <img src={appLogo} alt="SIGMA-GCM" loading="eager" decoding="async" />
             </div>
             <h1 className="text-3xl font-bold text-gray-900">Concluir Cadastro</h1>
             <p className="text-gray-500 mt-1">Olá, {user.displayName}! Complete seus dados para acessar o sistema.</p>
@@ -2655,14 +3096,8 @@ function App() {
           className="w-full max-w-md"
         >
           <div className="text-center mb-8">
-            <div className="mx-auto h-24 w-24 rounded-2xl overflow-hidden shadow-xl mb-4 bg-blue-900">
-              <img
-                src={appLogo}
-                alt="SIGMA-GCM"
-                className="h-full w-full object-cover"
-                loading="eager"
-                decoding="async"
-              />
+            <div className="sigma-brand-frame mx-auto mb-4 aspect-square w-full max-w-[min(240px,88vw)] shadow-xl ring-2 ring-black/[0.08]">
+              <img src={appLogo} alt="SIGMA-GCM" loading="eager" decoding="async" />
             </div>
             <h1 className="text-3xl font-bold text-gray-900">SIGMA-GCM</h1>
             <p className="text-gray-500 mt-1">Gestão e Monitoramento Avançado</p>
@@ -2700,7 +3135,7 @@ function App() {
                 type="password"
                 label="Senha" 
                 placeholder="••••••••" 
-                icon={Shield}
+                icon={Lock}
                 required
               />
 
@@ -2785,8 +3220,8 @@ function App() {
           animate={{ opacity: 1, y: 0 }}
           className="bg-slate-800 p-8 rounded-2xl shadow-2xl max-w-md w-full text-center border border-slate-700"
         >
-          <div className="w-20 h-20 bg-amber-500/10 rounded-full flex items-center justify-center mx-auto mb-6">
-            <Shield className="w-10 h-10 text-amber-500" />
+          <div className="sigma-brand-frame mx-auto mb-6 aspect-square w-32 max-w-[min(200px,70vw)] ring-2 ring-amber-500/40">
+            <img src={appLogo} alt="SIGMA-GCM" decoding="async" />
           </div>
           <h1 className="text-2xl font-bold text-white mb-4">Acesso Pendente</h1>
           <p className="text-slate-400 mb-8">
@@ -2854,14 +3289,8 @@ function App() {
       )}>
         <div className={cn("flex items-center justify-between gap-2", activeTab === 'map' ? "mb-0" : "mb-3 sm:mb-4")}>
           <div className="flex items-center gap-3">
-            <div className="w-11 h-11 sm:w-12 sm:h-12 bg-white/10 rounded-xl overflow-hidden shadow-sm border border-white/10">
-              <img
-                src={appLogo}
-                alt="SIGMA-GCM"
-                className="w-full h-full object-cover"
-                loading="eager"
-                decoding="async"
-              />
+            <div className="sigma-brand-frame sigma-brand-frame--sm h-11 w-11 shrink-0 border border-white/20 shadow-sm sm:h-12 sm:w-12">
+              <img src={appLogo} alt="SIGMA-GCM" loading="eager" decoding="async" />
             </div>
             <div>
               <h1 className="font-bold text-base sm:text-lg leading-tight">SIGMA-GCM</h1>
@@ -2886,7 +3315,7 @@ function App() {
                     title={`${pendingUsersCount} cadastro(s) pendente(s)`}
                   />
                 )}
-                <Shield className="w-4 h-4" />
+                <LayoutDashboard className="w-4 h-4" />
                 <span className="hidden sm:inline text-xs font-bold uppercase tracking-wider">Admin</span>
               </button>
             )}
@@ -2914,7 +3343,10 @@ function App() {
         </div>
 
         {/* Operational Info Banner */}
-        {!isHeaderCollapsed && profile?.teamId && activeTab !== 'map' && (
+        {!isHeaderCollapsed &&
+          profile?.teamId &&
+          profile.role !== 'admin' &&
+          activeTab !== 'map' && (
           <div className="bg-white/10 rounded-2xl mb-4 backdrop-blur-md border border-white/10 overflow-hidden">
             {(() => {
               const team = teams.find(t => t.id === profile.teamId);
@@ -2935,8 +3367,8 @@ function App() {
                         </div>
                       </div>
                       <div className="flex items-center gap-2">
-                        <div className="p-1.5 bg-purple-500/20 rounded-lg">
-                          <Users className="w-4 h-4 text-purple-300" />
+                        <div className="sigma-brand-frame sigma-brand-frame--sm h-8 w-8 flex-shrink-0 ring-1 ring-white/15">
+                          <img src={appLogo} alt="" decoding="async" />
                         </div>
                         <div>
                           <p className="text-[10px] text-blue-300 uppercase font-bold leading-none mb-1">Equipe</p>
@@ -3222,21 +3654,33 @@ function App() {
                       </span>
                       <div className="h-px flex-1 bg-gray-200" />
                     </div>
-                    {group.items.map((patrol) => (
+                    {group.items.map((patrol) => {
+                      const irr = patrolEffectiveValidationStatus(patrol) === 'FORA_DO_RAIO';
+                      return (
                       <Card key={patrol.id} className="p-4 flex items-center justify-between">
                         <div className="flex items-center gap-3">
-                          <div className="w-10 h-10 rounded-full bg-green-50 flex items-center justify-center">
-                            <CheckCircle2 className="w-6 h-6 text-green-600" />
+                          <div className={cn(
+                            'w-10 h-10 rounded-full flex items-center justify-center',
+                            irr ? 'bg-amber-50' : 'bg-green-50',
+                          )}>
+                            {irr ? (
+                              <AlertTriangle className="w-6 h-6 text-amber-600" />
+                            ) : (
+                              <CheckCircle2 className="w-6 h-6 text-green-600" />
+                            )}
                           </div>
                           <div>
                             <h4 className="font-bold text-gray-900">{patrol.propertyName}</h4>
                             <p className="text-xs text-blue-600 font-mono font-bold mt-0.5">{patrol.plusCode}</p>
                             <p className="text-xs text-gray-500 mt-1">{format(new Date(patrol.timestamp), 'HH:mm')} • {patrol.vehicleId}</p>
+                            {irr && (
+                              <p className="text-[10px] font-black text-amber-700 uppercase mt-1">Fora do raio</p>
+                            )}
                           </div>
                         </div>
                         <ChevronRight className="w-5 h-5 text-gray-300" />
                       </Card>
-                    ))}
+                    );})}
                   </div>
                 ))}
                 {patrols.length === 0 && (
@@ -3290,16 +3734,34 @@ function App() {
                       <div className="h-px flex-1 bg-gray-200" />
                     </div>
                     {group.items.map((patrol) => (
-                      <Card key={patrol.id} className="p-4">
+                      <Card
+                        key={patrol.id}
+                        className={cn(
+                          'p-4 border-l-4',
+                          patrolEffectiveValidationStatus(patrol) === 'FORA_DO_RAIO'
+                            ? 'border-l-amber-500 bg-amber-50/30'
+                            : 'border-l-transparent',
+                        )}
+                      >
                         <div className="flex justify-between items-start mb-2">
                           <div>
                             <h4 className="font-bold text-gray-900">{patrol.propertyName}</h4>
                             <p className="text-xs text-blue-600 font-mono font-bold mt-0.5">{patrol.plusCode}</p>
                             <p className="text-sm text-gray-500 mt-1">{format(new Date(patrol.timestamp), 'dd/MM/yyyy HH:mm')}</p>
+                            {patrolEffectiveValidationStatus(patrol) === 'FORA_DO_RAIO' && typeof patrol.distanceMeters === 'number' && (
+                              <p className="text-[11px] font-bold text-amber-700 mt-1">
+                                Antifraude: ~{patrol.distanceMeters} m do posto (limite {patrol.allowedRadiusMeters ?? 50} m)
+                              </p>
+                            )}
                           </div>
+                          <div className="flex flex-col items-end gap-1">
                           <Badge variant={patrol.status === 'normal' ? 'success' : patrol.status === 'attention' ? 'warning' : 'error'}>
                             {patrol.status?.toUpperCase() || 'N/A'}
                           </Badge>
+                          {patrolEffectiveValidationStatus(patrol) === 'FORA_DO_RAIO' && (
+                            <Badge variant="warning">FORA DO RAIO</Badge>
+                          )}
+                          </div>
                         </div>
                         <div className="flex items-center justify-between mt-4">
                           <div className="flex items-center gap-4 text-xs text-gray-400">
@@ -3654,7 +4116,7 @@ function App() {
 
       {/* Bottom Navigation */}
       <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-100 px-4 py-3 safe-pb flex items-center justify-between z-40 overflow-x-auto scrollbar-hide">
-        <NavButton active={activeTab === 'home'} onClick={() => setActiveTab('home')} icon={Shield} label="Início" />
+        <NavButton active={activeTab === 'home'} onClick={() => setActiveTab('home')} icon={Home} label="Início" />
         <NavButton active={activeTab === 'map'} onClick={() => setActiveTab('map')} icon={MapIcon} label="Mapa" />
         <NavButton active={activeTab === 'history'} onClick={() => setActiveTab('history')} icon={History} label="Rondas" />
         <NavButton active={activeTab === 'dashboard'} onClick={() => setActiveTab('dashboard')} icon={LayoutDashboard} label="Painel" />
@@ -3736,6 +4198,7 @@ function App() {
           <TeamVehicleSetupModal 
             teams={teams} 
             vehicles={vehicles} 
+            initialVehicleId={profile?.vehicleId}
             loading={setupTeamVehicleSaving}
             onSave={handleSetupTeamVehicle} 
             canCreateUsers={profile?.role === 'admin' || profile?.role === 'supervisor' || profile?.role === 'command'}
@@ -3833,13 +4296,13 @@ function App() {
                     setLoading(true);
                     try {
                       for (const prop of initialProps) {
-                        await addDoc(collection(db, 'properties'), prop);
+                        await addDocClean(collection(db, 'properties'), prop as unknown as Record<string, unknown>);
                       }
                       for (const v of initialVehicles) {
-                        await addDoc(collection(db, 'vehicles'), v);
+                        await addDocClean(collection(db, 'vehicles'), v as unknown as Record<string, unknown>);
                       }
                       for (const t of initialTeams) {
-                        await addDoc(collection(db, 'teams'), t);
+                        await addDocClean(collection(db, 'teams'), t as unknown as Record<string, unknown>);
                       }
                     } catch (err) {
                       handleFirestoreError(err, OperationType.CREATE, 'properties');
@@ -4011,7 +4474,7 @@ function App() {
                       setLoading(true);
                       try {
                         const { id, ...data } = editingProperty;
-                        await updateDoc(doc(db, 'properties', id), data);
+                        await updateDocClean(doc(db, 'properties', id), data as unknown as Record<string, unknown>);
                         setShowEditPropertyModal(false);
                         // Evita alerta modal persistente no navegador/Android; feedback vem pela atualização em tempo real.
                       } catch (err) {
@@ -4131,10 +4594,10 @@ function App() {
                         const randomCode = Math.random().toString(36).substring(7).toUpperCase();
                         const qrCode = `${newProperty.name.toUpperCase()} - ${randomCode}`;
                         
-                        await addDoc(collection(db, path), {
+                        await addDocClean(collection(db, path), {
                           ...newProperty,
                           qrCode,
-                          status: 'operational'
+                          status: 'operational',
                         });
                         setShowNewPropertyModal(false);
                         setNewProperty({
@@ -4258,20 +4721,14 @@ function App() {
                 <Button 
                   className="flex-1" 
                   onClick={() => {
-                    const host = window.location.hostname;
-                    const isLocalhost = host === 'localhost' || host === '127.0.0.1' || host === '::1';
-                    if (isLocalhost && scannedProperty) {
-                      confirmPatrol(
-                        { latitude: scannedProperty.latitude, longitude: scannedProperty.longitude },
-                        scannedProperty,
-                      );
-                    } else {
-                      confirmPatrol();
-                    }
+                    // Sempre GPS real: o WebView do Capacitor usa host `localhost` e, com a lógica antiga,
+                    // a posição simulada no posto zerava a distância (antifraude nunca disparava no APK).
+                    // Teste "como se estivesse no posto" só via "Simular Localização" abaixo.
+                    void confirmPatrol();
                   }}
-                  disabled={loading}
+                  disabled={loading || patrolFlowBusy}
                 >
-                  {loading ? (patrolMessage || 'Processando...') : 'Confirmar Ronda'}
+                  {patrolFlowBusy ? (patrolMessage || 'Processando...') : 'Confirmar Ronda'}
                 </Button>
               </div>
               
@@ -4286,16 +4743,40 @@ function App() {
                 <button 
                   onClick={() => {
                     if (scannedProperty) {
-                      confirmPatrol({ 
-                        latitude: scannedProperty.latitude, 
-                        longitude: scannedProperty.longitude 
-                      }, scannedProperty);
+                      const a = patrolAnchorFromProperty(scannedProperty);
+                      void confirmPatrol({ latitude: a.latitude, longitude: a.longitude }, scannedProperty);
                     }
                   }}
                   className="text-[10px] text-gray-400 hover:text-blue-600 transition-colors uppercase font-bold tracking-widest"
                 >
                   Simular Localização (Apenas para Testes)
                 </button>
+
+                {(() => {
+                  const enabled =
+                    (import.meta.env.VITE_ENABLE_ANTIFRAUD_TEST as string | undefined) === 'true' ||
+                    window.location.hostname === 'localhost' ||
+                    window.location.hostname === '127.0.0.1' ||
+                    window.location.hostname === '::1';
+                  const canUse = (profile?.role || '') === 'admin';
+                  if (!enabled || !canUse) return null;
+                  return (
+                    <div className="mt-3">
+                      <button
+                        onClick={() => {
+                          if (!scannedProperty) return;
+                          const a = patrolAnchorFromProperty(scannedProperty);
+                          const far = offsetLatLngByMeters({ latitude: a.latitude, longitude: a.longitude }, 0, 1000);
+                          void confirmPatrol(far, scannedProperty);
+                        }}
+                        className="text-[10px] text-amber-700 hover:text-amber-900 transition-colors uppercase font-bold tracking-widest"
+                        title="Simula uma posição ~1 km longe do posto (força FORA_DO_RAIO)"
+                      >
+                        Testar Antifraude (Simular ~1 km)
+                      </button>
+                    </div>
+                  );
+                })()}
               </div>
             </motion.div>
           </div>
@@ -4441,7 +4922,9 @@ function App() {
 
                   <div className="p-4 bg-blue-50 rounded-xl border border-blue-100">
                     <div className="flex items-center gap-3 mb-2">
-                      <Shield className="w-5 h-5 text-blue-900" />
+                      <div className="sigma-brand-frame sigma-brand-frame--sm h-9 w-9 flex-shrink-0 ring-1 ring-blue-200">
+                        <img src={appLogo} alt="" decoding="async" />
+                      </div>
                       <h5 className="font-bold text-blue-900 text-sm">Status Operacional</h5>
                     </div>
                     <p className="text-xs text-blue-700 leading-relaxed">
@@ -4518,7 +5001,7 @@ function App() {
                     setLoading(true);
                     const updatedProfile = { ...profile, name: newName, registration: newReg };
                     const path = 'users';
-                    await setDoc(doc(db, path, profile.uid), updatedProfile);
+                    await setDocClean(doc(db, path, profile.uid), updatedProfile as unknown as Record<string, unknown>, { merge: true });
                     setProfile(updatedProfile);
                     setIsEditingProfile(false);
                     alert('Perfil atualizado com sucesso!');
@@ -4593,19 +5076,22 @@ function App() {
                 const submitData = async (lat: number, lng: number) => {
                   try {
                     const path = 'occurrences';
-                    await addDoc(collection(db, path), {
-                      agentId: profile?.uid,
-                      agentName: profile?.name,
-                      teamId: profile?.teamId,
-                      timestamp: new Date().toISOString(),
-                      description,
-                      type,
-                      propertyId,
-                      propertyName,
-                      photoUrl: occurrencePhoto,
-                      latitude: lat,
-                      longitude: lng
-                    });
+                    await addDoc(
+                      collection(db, path),
+                      limparDados({
+                        agentId: profile?.uid,
+                        agentName: profile?.name,
+                        teamId: profile?.teamId,
+                        timestamp: new Date().toISOString(),
+                        description,
+                        type,
+                        propertyId,
+                        propertyName,
+                        photoUrl: occurrencePhoto ?? null,
+                        latitude: lat,
+                        longitude: lng,
+                      } as Record<string, unknown>),
+                    );
                     alert('Ocorrência registrada com sucesso!');
                     setOccurrencePhoto(null);
                     setShowOccurrenceModal(false);

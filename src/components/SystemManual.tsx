@@ -1,7 +1,6 @@
 import React, { useRef } from 'react';
 import { motion } from 'motion/react';
 import { 
-  Shield, 
   BookOpen, 
   Target, 
   Workflow, 
@@ -20,6 +19,7 @@ import { jsPDF } from 'jspdf';
 import html2canvas from 'html2canvas';
 import { cn } from '../lib/utils';
 import { Button } from './ui/Button';
+import appLogo from '../assets/sigma-brand.png';
 
 interface SystemManualProps {
   onClose: () => void;
@@ -301,18 +301,22 @@ export const SystemManual: React.FC<SystemManualProps> = ({ onClose }) => {
           id="manual-content"
           className="max-w-4xl mx-auto bg-white rounded-2xl sm:rounded-3xl shadow-2xl overflow-hidden text-slate-800"
         >
-          {/* Cover / Intro */}
-          <div className="bg-blue-900 p-6 sm:p-12 text-center text-white relative overflow-hidden">
+          {/* Cover / Intro — faixa do logo em largura total (como PDF full-bleed) */}
+          <div className="bg-blue-900 text-center text-white relative overflow-hidden">
             <div className="absolute top-0 left-0 w-full h-full opacity-10 pointer-events-none">
               <div className="absolute top-0 left-0 w-full h-full bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-white via-transparent to-transparent" />
             </div>
-            <Shield className="w-14 h-14 sm:w-20 sm:h-20 mx-auto mb-4 sm:mb-6 text-blue-400" />
-            <h1 className="text-3xl sm:text-4xl font-black mb-3 sm:mb-4 tracking-tight">SIGMA-GCM</h1>
-            <p className="text-base sm:text-xl text-blue-200 font-medium max-w-2xl mx-auto">
-              Manual de Uso Institucional, Técnico e Operacional
-            </p>
-            <div className="mt-8 inline-flex items-center gap-2 px-4 py-2 bg-white/10 rounded-full text-xs font-bold uppercase tracking-widest">
-              Versão 1.0.0 • 2026
+            <div className="relative sigma-brand-frame w-full h-[10rem] sm:h-[11rem] border-b border-white/20 shadow-inner">
+              <img src={appLogo} alt="SIGMA-GCM" decoding="async" />
+            </div>
+            <div className="relative px-6 sm:px-12 py-8 sm:py-10">
+              <h1 className="text-3xl sm:text-4xl font-black mb-3 sm:mb-4 tracking-tight">SIGMA-GCM</h1>
+              <p className="text-base sm:text-xl text-blue-200 font-medium max-w-2xl mx-auto">
+                Manual de Uso Institucional, Técnico e Operacional
+              </p>
+              <div className="mt-8 inline-flex items-center gap-2 px-4 py-2 bg-white/10 rounded-full text-xs font-bold uppercase tracking-widest">
+                Versão 1.0.0 • 2026
+              </div>
             </div>
           </div>
 
@@ -320,8 +324,8 @@ export const SystemManual: React.FC<SystemManualProps> = ({ onClose }) => {
             {/* 1. Apresentação */}
             <section className="space-y-8">
               <div className="flex items-center gap-5 text-blue-900">
-                <div className="p-4 bg-blue-50 rounded-2xl shadow-sm">
-                  <Shield className="w-10 h-10" />
+                <div className="sigma-brand-frame sigma-brand-frame--md flex h-14 w-14 shrink-0 shadow-sm ring-1 ring-blue-100">
+                  <img src={appLogo} alt="" decoding="async" />
                 </div>
                 <div>
                   <h2 className="text-3xl font-black uppercase tracking-tight">01. Apresentação</h2>
@@ -424,8 +428,8 @@ export const SystemManual: React.FC<SystemManualProps> = ({ onClose }) => {
                     referrerPolicy="no-referrer"
                   />
                   <div className="absolute inset-0 flex flex-col items-center justify-center p-12 text-center bg-blue-900/50 backdrop-blur-[1px]">
-                    <div className="p-6 bg-white/10 rounded-full mb-6 backdrop-blur-xl border border-white/20">
-                      <Shield className="w-20 h-20 text-white drop-shadow-2xl" />
+                    <div className="sigma-brand-frame relative mb-6 aspect-square w-28 border border-white/30 shadow-lg backdrop-blur-xl">
+                      <img src={appLogo} alt="" decoding="async" />
                     </div>
                     <h3 className="text-4xl font-black text-white mb-4 drop-shadow-2xl tracking-tighter">CICLO OPERACIONAL</h3>
                     <div className="flex items-center gap-4">
@@ -444,8 +448,8 @@ export const SystemManual: React.FC<SystemManualProps> = ({ onClose }) => {
             {/* Footer Manual */}
             <div className="pt-16 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-8 text-slate-400 text-sm font-bold">
               <div className="flex items-center gap-3">
-                <div className="p-2 bg-slate-50 rounded-lg">
-                  <Shield className="w-5 h-5 text-blue-900/40" />
+                <div className="sigma-brand-frame sigma-brand-frame--sm flex h-9 w-9 shrink-0 ring-1 ring-slate-200">
+                  <img src={appLogo} alt="" className="opacity-95" decoding="async" />
                 </div>
                 <div className="flex flex-col">
                   <span className="text-slate-900 uppercase tracking-tighter">SIGMA-GCM</span>

@@ -1,0 +1,45 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isAtivo() {
+      return isAuthenticated() && getUserData().status == 'ATIVO';
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && getUserData().role == 'admin' && getUserData().status == 'ATIVO';
+    }
+
+    function isMasterEmailToken() {
+      return isAuthenticated()
+        && request.auth.token.email != null
+        && request.auth.token.email == 'andersonf.g.marques@gmail.com';
+    }
+
+    // Fotos de perfil: apenas o próprio usuário ATIVO pode escrever; admins podem ler.
+    match /profiles/{uid}/{allPaths=**} {
+      allow read: if isAdmin() || (isAuthenticated() && request.auth.uid == uid);
+      allow write: if isAtivo() && request.auth.uid == uid;
+    }
+
+    // Relatórios de plantão (PDF): apenas o próprio agente ATIVO pode escrever no seu path; admins podem ler.
+    match /shift_reports/{uid}/{allPaths=**} {
+      allow read: if isAdmin();
+      allow write: if isAtivo() && request.auth.uid == uid;
+      allow delete: if isMasterEmailToken();
+    }
+
+    // Default: bloqueia todo o resto.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}
+

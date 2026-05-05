@@ -38,10 +38,23 @@ app.use((req, res, next) => {
   if (!isApi) return next();
 
   // Em dev, liberamos origens locais e o origin do WebView (capacitor://localhost).
-  // Para produção, vale restringir por allowlist.
+  // `https://localhost` aparece com `androidScheme: "https"` no Capacitor; com `*` o browser
+  // costuma bloquear `fetch` com header `Authorization` ("Failed to fetch").
+  const extra = String(process.env.CORS_EXTRA_ORIGINS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
   const allowOrigin =
-    origin.startsWith("http://localhost") ||
-    origin.startsWith("http://127.0.0.1") ||
+    extra.includes(origin) ||
+    // `http://localhost` (sem porta) é comum no Vite/Capacitor; `startsWith("http://localhost")` NÃO cobre isso.
+    origin === "http://localhost" ||
+    origin === "https://localhost" ||
+    origin.startsWith("http://localhost:") ||
+    origin.startsWith("https://localhost:") ||
+    origin === "http://127.0.0.1" ||
+    origin === "https://127.0.0.1" ||
+    origin.startsWith("http://127.0.0.1:") ||
+    origin.startsWith("https://127.0.0.1:") ||
     origin.startsWith("capacitor://localhost") ||
     origin.startsWith("ionic://localhost") ||
     origin.startsWith("http://192.168.") ||
@@ -52,7 +65,7 @@ app.use((req, res, next) => {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
   } else {
-    // fallback mais permissivo em dev (evita bloquear requests sem Origin)
+    // fallback (ex.: ferramentas sem Origin). Com `Authorization`, alguns browsers rejeitam `*` em CORS.
     res.setHeader("Access-Control-Allow-Origin", "*");
   }
 

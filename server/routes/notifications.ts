@@ -16,6 +16,9 @@ function getMailTransportIfConfigured() {
     port,
     secure: port === 465,
     auth: { user, pass },
+    connectionTimeout: 20_000,
+    greetingTimeout: 20_000,
+    socketTimeout: 60_000,
   });
 }
 

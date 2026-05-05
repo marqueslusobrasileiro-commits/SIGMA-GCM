@@ -2,6 +2,7 @@ import { doc, getDocFromServer } from "firebase/firestore";
 import { format } from "date-fns";
 import type { Firestore } from "firebase/firestore";
 import type { OccurrenceRecord, PatrolRecord, Team, UserProfile } from "../../types";
+import { patrolEffectiveValidationStatus } from "../patrolGeo";
 import { buildAiPrompt, cleanTrailingWhitespace, sortByTimestampAsc } from "./reportUtils";
 import { getShiftWindow, isWithinWindow, normalizeShift } from "../shifts";
 import { addSigmaHeader } from "./pdfBranding";
@@ -140,16 +141,28 @@ export async function generateEndOfShiftReportPdf(
     format(new Date(p.timestamp), "HH:mm"),
     p.propertyName,
     p.plusCode || "-",
+    patrolEffectiveValidationStatus(p),
+    typeof p.distanceMeters === "number" ? `${p.distanceMeters} m` : "-",
     p.status?.toUpperCase() || "NORMAL",
-    p.observation || "-",
+    (p.observation || "-").slice(0, 120),
   ]);
 
   autoTable(pdfDoc, {
     startY: 130,
-    head: [["Horário", "Local / Próprio Público", "Plus Code", "Status", "Observações"]],
+    head: [
+      [
+        "Horário",
+        "Local",
+        "Plus Code",
+        "Validação",
+        "Dist.",
+        "Status",
+        "Obs. (resumo)",
+      ],
+    ],
     body: patrolTableData,
     headStyles: { fillColor: [0, 33, 71] },
-    styles: { fontSize: 8 },
+    styles: { fontSize: 7 },
     margin: { left: 20, right: 20 },
   });
 
@@ -158,6 +171,35 @@ export async function generateEndOfShiftReportPdf(
   pdfDoc.setFont("helvetica", "bold");
   pdfDoc.text(`Total de locais visitados: ${shiftPatrols.length}`, 20, finalY);
 
+  const irregularPatrols = shiftPatrols.filter((p) => patrolEffectiveValidationStatus(p) === "FORA_DO_RAIO");
+  if (irregularPatrols.length > 0) {
+    finalY += 12;
+    if (finalY > 240) {
+      pdfDoc.addPage();
+      finalY = 20;
+    }
+    pdfDoc.setFont("helvetica", "bold");
+    pdfDoc.setFontSize(11);
+    pdfDoc.setTextColor(180, 0, 0);
+    pdfDoc.text("AVISO: IRREGULARIDADE — ronda fora do raio do posto", 20, finalY);
+    pdfDoc.setTextColor(0, 0, 0);
+    pdfDoc.line(20, finalY + 2, 190, finalY + 2);
+    pdfDoc.setFont("helvetica", "normal");
+    pdfDoc.setFontSize(9);
+    let y = finalY + 10;
+    for (const p of irregularPatrols) {
+      const line = `• ${p.propertyName} — ${typeof p.distanceMeters === "number" ? `${p.distanceMeters} m` : "?"} do posto — ${format(new Date(p.timestamp), "dd/MM/yyyy HH:mm")} — ${p.agentName} — ${p.vehiclePrefix || p.vehicleId || "VTR"}`;
+      const wrapped = pdfDoc.splitTextToSize(line, 170);
+      if (y > 270) {
+        pdfDoc.addPage();
+        y = 20;
+      }
+      pdfDoc.text(wrapped, 20, y);
+      y += wrapped.length * 5 + 4;
+    }
+    finalY = y;
+  }
+
   // Optional AI summary (server-side Gemini; no secrets in client)
   try {
     const prompt = buildAiPrompt({
@@ -165,7 +207,12 @@ export async function generateEndOfShiftReportPdf(
       todayOccurrences: shiftOccurrences,
     });
 
-    const aiText = await generateGeminiText({ prompt });
+    const aiText = await Promise.race([
+      generateGeminiText({ prompt }),
+      new Promise<string>((_, reject) => {
+        globalThis.setTimeout(() => reject(new Error("Gemini: tempo esgotado")), 14_000);
+      }),
+    ]);
     const cleaned = cleanTrailingWhitespace(aiText);
     if (cleaned) {
       finalY += 10;
@@ -245,7 +292,12 @@ export async function generateEndOfShiftReportPdf(
         );
         finalY += 5;
         try {
-          const imgData = await loadImage(occ.photoUrl!);
+          const imgData = await Promise.race([
+            loadImage(occ.photoUrl!),
+            new Promise<string>((_, reject) => {
+              globalThis.setTimeout(() => reject(new Error("Foto: tempo esgotado")), 18_000);
+            }),
+          ]);
           pdfDoc.addImage(imgData, "JPEG", 20, finalY, 60, 45);
           finalY += 55;
         } catch (e) {
@@ -270,7 +322,7 @@ export async function generateEndOfShiftReportPdf(
 
   const filename = `Relatorio_Plantao_${profile.registration || "GCM"}_${format(window.start, "yyyyMMdd")}.pdf`;
   const blob = pdfDoc.output("blob");
-  pdfDoc.save(filename);
+  /** Não chamar `pdfDoc.save()` aqui: no APK/WebView abre fluxo de download nativo e pode travar o modal «Enviando…». */
   return {
     filename,
     blob,
