@@ -45,12 +45,17 @@ if (!admin.apps.length) {
     process.env.GCP_PROJECT ||
     undefined;
 
+  const storageBucket =
+    process.env.FIREBASE_STORAGE_BUCKET ||
+    process.env.STORAGE_BUCKET ||
+    (projectId ? `${projectId}.appspot.com` : undefined);
+
   const credential = loadServiceAccountCredential();
 
   if (credential) {
-    admin.initializeApp({ credential, projectId });
+    admin.initializeApp({ credential, projectId, storageBucket });
   } else {
-    admin.initializeApp({ projectId });
+    admin.initializeApp({ projectId, storageBucket });
     const prodLike =
       process.env.NODE_ENV === "production" ||
       process.env.RENDER === "true" ||
@@ -72,3 +77,4 @@ if (!admin.apps.length) {
 
 export { admin };
 export const db = admin.firestore();
+export const storageBucket = admin.storage().bucket();

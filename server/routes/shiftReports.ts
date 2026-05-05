@@ -2,7 +2,7 @@ import type express from "express";
 import fs from "node:fs/promises";
 import path from "node:path";
 import nodemailer from "nodemailer";
-import { db } from "../lib/firebaseAdmin";
+import { db, storageBucket } from "../lib/firebaseAdmin";
 import { requireFirebaseAuth } from "../lib/httpAuth";
 
 function getMailTransportIfConfigured() {
@@ -71,6 +71,33 @@ async function ensureUploadDir() {
   const dir = path.resolve(process.cwd(), "server", "uploads", "shift_reports");
   await fs.mkdir(dir, { recursive: true });
   return dir;
+}
+
+function inferStoragePathFromDoc(opts: { reportId: string; data: any }): string | null {
+  const { reportId, data } = opts;
+  const explicit = String(data?.storagePath || "").trim();
+  if (explicit) return explicit;
+  const agentId = String(data?.agentId || "").trim();
+  if (agentId) return `shift_reports/${agentId}/${reportId}.pdf`;
+  return null;
+}
+
+async function tryReadPdfFromStorage(opts: { reportId: string; data: any }): Promise<Buffer | null> {
+  const storagePath = inferStoragePathFromDoc(opts);
+  if (!storagePath) return null;
+  try {
+    const [buf] = await storageBucket.file(storagePath).download();
+    if (!buf?.length) return null;
+    return buf;
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn("[shift-reports] storage fallback failed", {
+      reportId: opts.reportId,
+      storagePath,
+      err: e instanceof Error ? e.message : String(e),
+    });
+    return null;
+  }
 }
 
 function absolutizeDownloadUrl(downloadUrl: string, req?: express.Request): string | null {
@@ -178,13 +205,32 @@ export function registerShiftReportRoutes(app: express.Express) {
     await fs.writeFile(filePath, buffer);
 
     const downloadUrl = `/api/shift-reports/file/${encodeURIComponent(finalReportId)}`;
+    const storagePath = `shift_reports/${decoded.uid}/${finalReportId}.pdf`;
+
+    // Persistência: também salva no Firebase Storage para sobreviver a redeploy/restart do Render.
+    try {
+      await storageBucket.file(storagePath).save(buffer, {
+        contentType: "application/pdf",
+        resumable: false,
+        metadata: {
+          cacheControl: "private, max-age=0, no-transform",
+        },
+      });
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn("[shift-reports] upload: falha ao salvar no Storage (continuando com localPath)", {
+        reportId: finalReportId,
+        storagePath,
+        err: e instanceof Error ? e.message : String(e),
+      });
+    }
 
     await docRef.set(
       {
         createdAt: new Date().toISOString(),
         filename: safeName,
         downloadUrl,
-        storagePath: "",
+        storagePath,
         localPath: filePath,
         // Se esse reportId já existia e estava na lixeira, ao re-enviar deve voltar para "Ativos".
         deletedAt: null,
@@ -287,6 +333,14 @@ export function registerShiftReportRoutes(app: express.Express) {
       res.send(file);
     } catch (e) {
       console.error("[shift-reports] file read failed", e);
+
+      // Fallback 1: Firebase Storage (persistente) via Admin SDK
+      const fromStorage = await tryReadPdfFromStorage({ reportId, data });
+      if (fromStorage?.length) {
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader("Content-Disposition", `inline; filename="${String(data?.filename || "relatorio.pdf")}"`);
+        return res.send(fromStorage);
+      }
 
       // Fallback: se o relatório veio do Firebase Storage (delivery=storage), o disco do Render não terá o arquivo.
       // Tentamos baixar pelo `downloadUrl` absoluto quando ele NÃO aponta para esta mesma rota.
