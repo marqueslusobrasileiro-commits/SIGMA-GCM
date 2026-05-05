@@ -4,6 +4,7 @@ import path from "node:path";
 import nodemailer from "nodemailer";
 import { db, storageBucket } from "../lib/firebaseAdmin";
 import { getPdfObject, putPdfObject } from "../lib/objectStorage";
+import { getPdfSupabase, putPdfSupabase } from "../lib/supabaseStorage";
 import { requireFirebaseAuth } from "../lib/httpAuth";
 
 function getMailTransportIfConfigured() {
@@ -90,6 +91,31 @@ function inferObjectKeyFromDoc(opts: { reportId: string; data: any }): string | 
   const agentId = String(data?.agentId || "").trim();
   if (agentId) return `shift_reports/${agentId}/${reportId}.pdf`;
   return null;
+}
+
+function inferSupabasePathFromDoc(opts: { reportId: string; data: any }): string | null {
+  const { reportId, data } = opts;
+  const explicit = String(data?.supabasePath || "").trim();
+  if (explicit) return explicit;
+  const agentId = String(data?.agentId || "").trim();
+  if (agentId) return `shift_reports/${agentId}/${reportId}.pdf`;
+  return null;
+}
+
+async function tryReadPdfFromSupabase(opts: { reportId: string; data: any }): Promise<Buffer | null> {
+  const p = inferSupabasePathFromDoc(opts);
+  if (!p) return null;
+  const res = await getPdfSupabase({ path: p });
+  if (!res.ok) {
+    // eslint-disable-next-line no-console
+    console.warn("[shift-reports] supabase storage fallback failed", {
+      reportId: opts.reportId,
+      path: p,
+      err: res.error,
+    });
+    return null;
+  }
+  return res.pdf;
 }
 
 async function tryReadPdfFromObjectStorage(opts: { reportId: string; data: any }): Promise<Buffer | null> {
@@ -233,28 +259,38 @@ export function registerShiftReportRoutes(app: express.Express) {
     const downloadUrl = `/api/shift-reports/file/${encodeURIComponent(finalReportId)}`;
     const storagePath = `shift_reports/${decoded.uid}/${finalReportId}.pdf`;
     const objectKey = storagePath; // mesma convenção do Storage (facilita migração)
+    const supabasePath = storagePath; // mesma convenção
 
-    // Persistência (preferência): salva em Object Storage S3-compatível (Backblaze B2 / R2).
-    const objRes = await putPdfObject({ key: objectKey, pdf: buffer, contentType: "application/pdf" });
-    if (!objRes.ok) {
-      // Fallback: tenta Firebase Storage (se existir/provisionado).
-      try {
-        await storageBucket.file(storagePath).save(buffer, {
-          contentType: "application/pdf",
-          resumable: false,
-          metadata: {
-            cacheControl: "private, max-age=0, no-transform",
-          },
-        });
-      } catch (e) {
-        // eslint-disable-next-line no-console
-        console.warn("[shift-reports] upload: falha ao salvar no Storage e no Object Storage (continuando com localPath)", {
-          reportId: finalReportId,
-          storagePath,
-          objectKey,
-          objErr: objRes.error,
-          err: e instanceof Error ? e.message : String(e),
-        });
+    // Persistência (preferência): Supabase Storage (free tier).
+    const sbRes = await putPdfSupabase({ path: supabasePath, pdf: buffer });
+    if (!sbRes.ok) {
+      // Persistência (fallback): Object Storage S3-compatível (Backblaze B2 / R2).
+      const objRes = await putPdfObject({ key: objectKey, pdf: buffer, contentType: "application/pdf" });
+      if (!objRes.ok) {
+        // Último fallback: tenta Firebase Storage (se existir/provisionado).
+        try {
+          await storageBucket.file(storagePath).save(buffer, {
+            contentType: "application/pdf",
+            resumable: false,
+            metadata: {
+              cacheControl: "private, max-age=0, no-transform",
+            },
+          });
+        } catch (e) {
+          // eslint-disable-next-line no-console
+          console.warn(
+            "[shift-reports] upload: falha ao salvar no Supabase, Object Storage e Firebase Storage (continuando com localPath)",
+            {
+              reportId: finalReportId,
+              storagePath,
+              objectKey,
+              supabasePath,
+              supabaseErr: sbRes.error,
+              objErr: objRes.error,
+              err: e instanceof Error ? e.message : String(e),
+            },
+          );
+        }
       }
     }
 
@@ -265,6 +301,7 @@ export function registerShiftReportRoutes(app: express.Express) {
         downloadUrl,
         storagePath,
         objectKey,
+        supabasePath,
         localPath: filePath,
         // Se esse reportId já existia e estava na lixeira, ao re-enviar deve voltar para "Ativos".
         deletedAt: null,
@@ -367,6 +404,14 @@ export function registerShiftReportRoutes(app: express.Express) {
       res.send(file);
     } catch (e) {
       console.error("[shift-reports] file read failed", e);
+
+      // Fallback 0 (preferido): Supabase Storage (free tier).
+      const fromSb = await tryReadPdfFromSupabase({ reportId, data });
+      if (fromSb?.length) {
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader("Content-Disposition", `inline; filename="${String(data?.filename || "relatorio.pdf")}"`);
+        return res.send(fromSb);
+      }
 
       // Fallback 0 (preferido): Object Storage (S3 compatível) — persistente e gratuito (B2/R2).
       const fromObj = await tryReadPdfFromObjectStorage({ reportId, data });
