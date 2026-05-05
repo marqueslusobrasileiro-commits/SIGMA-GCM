@@ -37,6 +37,7 @@
     "@capacitor/share": "^8.0.1",
     "@capawesome/capacitor-google-sign-in": "^0.1.2",
     "@capgo/capacitor-native-biometric": "^8.4.2",
+    "@aws-sdk/client-s3": "^3.888.0",
     "@google/genai": "^1.29.0",
     "@googlemaps/js-api-loader": "^2.0.2",
     "@react-google-maps/api": "^2.20.8",
