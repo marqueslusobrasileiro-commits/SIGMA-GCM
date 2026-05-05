@@ -31,6 +31,21 @@ app.set("trust proxy", true);
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 const JWT_SECRET = process.env.JWT_SECRET || "sigma-gcm-secret-key";
 
+app.get("/api/version", (_req, res) => {
+  res.json({
+    ok: true,
+    nowIso: new Date().toISOString(),
+    uptimeSec: Math.round(process.uptime()),
+    render: {
+      commit: process.env.RENDER_GIT_COMMIT || null,
+      branch: process.env.RENDER_GIT_BRANCH || null,
+      serviceId: process.env.RENDER_SERVICE_ID || null,
+      externalUrl: process.env.RENDER_EXTERNAL_URL || null,
+    },
+    nodeEnv: process.env.NODE_ENV || null,
+  });
+});
+
 // CORS (necessário para o APK/Capacitor: origem costuma ser capacitor://localhost)
 app.use((req, res, next) => {
   const origin = String(req.headers.origin || "");
