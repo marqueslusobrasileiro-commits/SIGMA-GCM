@@ -172,6 +172,37 @@ function absolutizeDownloadUrl(downloadUrl: string, req?: express.Request): stri
   return `${base}${u}`;
 }
 
+/** PDF sem depender de `localPath` (ex.: disco efémero no Render limpou o ficheiro, mas o doc tem `supabasePath`). */
+async function tryReadPdfFromCloudOrExternalDownloadUrl(opts: {
+  reportId: string;
+  data: any;
+  req?: express.Request;
+}): Promise<Buffer | null> {
+  const { reportId, data, req } = opts;
+  const fromSb = await tryReadPdfFromSupabase({ reportId, data });
+  if (fromSb?.length) return fromSb;
+  const fromObj = await tryReadPdfFromObjectStorage({ reportId, data });
+  if (fromObj?.length) return fromObj;
+  const fromStorage = await tryReadPdfFromStorage({ reportId, data });
+  if (fromStorage?.length) return fromStorage;
+
+  const downloadAbs = absolutizeDownloadUrl(String(data?.downloadUrl || ""), req);
+  if (!downloadAbs || !/^https?:\/\//i.test(downloadAbs)) return null;
+  const selfPrefix = `/api/shift-reports/file/${encodeURIComponent(reportId)}`;
+  const isSelf =
+    downloadAbs.endsWith(selfPrefix) ||
+    downloadAbs.includes(`/api/shift-reports/file/${encodeURIComponent(reportId)}`);
+  if (isSelf) return null;
+  try {
+    const resp = await fetch(downloadAbs, { method: "GET" });
+    if (!resp.ok) return null;
+    const buf = Buffer.from(await resp.arrayBuffer());
+    return buf.length ? buf : null;
+  } catch {
+    return null;
+  }
+}
+
 async function readPdfBufferForEmail(opts: {
   reportId: string;
   data: any;
@@ -418,7 +449,15 @@ export function registerShiftReportRoutes(app: express.Express) {
         console.warn("[shift-reports] recovery failed", e);
       }
     }
-    if (!filePath) return res.status(404).send("file not available");
+    if (!filePath) {
+      const cloudOnly = await tryReadPdfFromCloudOrExternalDownloadUrl({ reportId, data, req });
+      if (cloudOnly?.length) {
+        res.setHeader("Content-Type", "application/pdf");
+        res.setHeader("Content-Disposition", `inline; filename="${String(data?.filename || "relatorio.pdf")}"`);
+        return res.send(cloudOnly);
+      }
+      return res.status(404).send("file not available");
+    }
 
     try {
       const file = await fs.readFile(filePath);
@@ -480,7 +519,10 @@ export function registerShiftReportRoutes(app: express.Express) {
         console.error("[shift-reports] fallback downloadUrl failed", fallbackErr);
       }
 
-      res.status(500).send("file read failed");
+      res.status(500).json({
+        error:
+          "PDF indisponível neste servidor (ficheiro em disco ausente) e não foi encontrado em Supabase, Object Storage nem Firebase Storage. Confirme SUPABASE_* no Render, ou peça um novo envio do relatório pelo app.",
+      });
     }
   });
 
