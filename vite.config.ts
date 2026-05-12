@@ -26,6 +26,8 @@ export default defineConfig(({mode}) => {
             viteCompression({
               algorithm: 'gzip',
               ext: '.gz',
+              // No Windows o plugin regista caminhos enganadores (`dist/C:/Users/...`); os .gz ficam em `dist/assets/`.
+              verbose: false,
             }),
           ]
         : []),

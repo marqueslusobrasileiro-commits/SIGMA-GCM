@@ -1431,7 +1431,11 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                                               });
                                               throw new Error(payload?.error || `Falha ao enviar (HTTP ${resp.status})`);
                                             }
-                                            alert('E-mail enviado para o ADM MASTER.');
+                                            const dest =
+                                              typeof payload?.emailTo === 'string' && payload.emailTo.trim()
+                                                ? payload.emailTo.trim()
+                                                : 'o endereço configurado em ADMIN_EMAIL no servidor';
+                                            alert(`E-mail enviado para:\n${dest}\n\nConfira também a pasta Spam/Lixo eletrônico.`);
                                           } catch (e) {
                                             console.error(e);
                                             if (Capacitor.isNativePlatform() && isShareCanceledError(e)) return;

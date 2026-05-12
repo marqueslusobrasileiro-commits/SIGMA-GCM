@@ -195,8 +195,31 @@ async function readPdfBufferForEmail(opts: {
     }
   }
 
+  // Mesma ordem que GET /api/shift-reports/file/:id — evita fetch HTTP à própria API
+  // (disco efémero → 500 "file read failed") quando o PDF existe no armazenamento persistente.
+  const fromSb = await tryReadPdfFromSupabase({ reportId, data });
+  if (fromSb?.length) return fromSb;
+
+  const fromObj = await tryReadPdfFromObjectStorage({ reportId, data });
+  if (fromObj?.length) return fromObj;
+
+  const fromStorage = await tryReadPdfFromStorage({ reportId, data });
+  if (fromStorage?.length) return fromStorage;
+
   const downloadAbs = absolutizeDownloadUrl(String(data?.downloadUrl || ""), req);
   if (downloadAbs) {
+    const selfPrefix = `/api/shift-reports/file/${encodeURIComponent(reportId)}`;
+    const isSelf =
+      downloadAbs.endsWith(selfPrefix) ||
+      downloadAbs.includes(`/api/shift-reports/file/${encodeURIComponent(reportId)}`);
+    // Evita fetch à própria API (quase sempre 500 com disco efémero) quando já não há PDF em lado nenhum.
+    if (isSelf) {
+      throw new Error(
+        "PDF indisponível: não está no disco deste servidor nem foi encontrado em Supabase, Object Storage nem Firebase Storage. " +
+          "Confirme que a API em produção está atualizada (último código), que SUPABASE_* / S3 / Firebase estão bem configurados no servidor e, se for preciso, peça ao agente para voltar a subir o relatório a partir do app.",
+      );
+    }
+
     const resp = await fetch(downloadAbs, {
       method: "GET",
       headers: authHeader ? { Authorization: authHeader } : undefined,
@@ -665,7 +688,7 @@ export function registerShiftReportRoutes(app: express.Express) {
         { merge: true },
       );
 
-      res.json({ ok: true });
+      res.json({ ok: true, emailTo: adminEmail });
     } catch (err) {
       console.error("[shift-reports] send(manual) failed:", err);
       const msg = err instanceof Error ? err.message : String(err);
