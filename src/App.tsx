@@ -96,7 +96,7 @@ import { auth, db, storage } from './firebase';
 import { getSecondaryAuth } from './lib/firebaseSecondary';
 import { cn } from './lib/utils';
 import { resolveOperationalTeam, fallbackTeamForPatrol } from './lib/resolveOperationalTeam';
-import { apiFetch, getApiBaseUrl } from './lib/apiClient';
+import { apiFetchShiftReport, getApiBaseUrl } from './lib/apiClient';
 import {
   registerShiftReportMetadataFirestore,
   uploadShiftReportPdfToFirebase,
@@ -1351,7 +1351,7 @@ function App() {
           reader.readAsDataURL(blob);
         });
 
-        const resp = await apiFetch('/api/shift-reports/upload', {
+        const resp = await apiFetchShiftReport('/api/shift-reports/upload', {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
@@ -1378,7 +1378,13 @@ function App() {
           const data = await resp.json().catch(() => ({}));
           throw new Error(data?.error || `Falha ao enviar para o servidor (HTTP ${resp.status})`);
         }
-        void (await resp.json().catch(() => ({})));
+        const data = await resp.json().catch(() => null as any);
+        if (!data?.ok) {
+          throw new Error(
+            (typeof data?.error === 'string' && data.error) ||
+              'Resposta inválida do servidor ao registrar o PDF. Se estiver no site (web.app), o upload deve ir para a API Render — atualize o app e tente novamente.',
+          );
+        }
       };
 
       try {

@@ -72,6 +72,31 @@ export async function apiFetch(input: string, init?: RequestInit): Promise<Respo
   return await fetch(input as any, init);
 }
 
+/**
+ * Rotas `/api/shift-reports/*` precisam do Node (ex. Render). No Firebase Hosting,
+ * `getApiBaseUrl()` é o origin estático (sem Express) — aí usamos a API externa.
+ */
+export function shiftReportsApiShouldUseExternal(): boolean {
+  if (Capacitor.isNativePlatform()) return true;
+  const base = getApiBaseUrl();
+  if (!base) return true;
+  try {
+    const host = new URL(base).hostname.toLowerCase();
+    if (host === "localhost" || host === "127.0.0.1" || host === "[::1]") return false;
+    if (host.endsWith(".web.app") || host.endsWith(".firebaseapp.com")) return true;
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+export async function apiFetchShiftReport(pathname: string, init?: RequestInit): Promise<Response> {
+  if (shiftReportsApiShouldUseExternal()) {
+    return apiFetchExternal(pathname, init, { retries: 2, baseDelayMs: 900, maxDelayMs: 6000 });
+  }
+  return apiFetch(pathname, init);
+}
+
 function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }

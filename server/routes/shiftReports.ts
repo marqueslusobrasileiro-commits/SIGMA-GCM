@@ -106,7 +106,7 @@ async function tryReadPdfFromSupabase(opts: { reportId: string; data: any }): Pr
   const p = inferSupabasePathFromDoc(opts);
   if (!p) return null;
   const res = await getPdfSupabase({ path: p });
-  if (!res.ok) {
+  if (res.ok === false) {
     // eslint-disable-next-line no-console
     console.warn("[shift-reports] supabase storage fallback failed", {
       reportId: opts.reportId,
@@ -122,7 +122,7 @@ async function tryReadPdfFromObjectStorage(opts: { reportId: string; data: any }
   const key = inferObjectKeyFromDoc(opts);
   if (!key) return null;
   const res = await getPdfObject({ key });
-  if (!res.ok) {
+  if (res.ok === false) {
     // eslint-disable-next-line no-console
     console.warn("[shift-reports] object storage fallback failed", {
       reportId: opts.reportId,
@@ -308,8 +308,8 @@ export function registerShiftReportRoutes(app: express.Express) {
               storagePath,
               objectKey,
               supabasePath,
-              supabaseErr: sbRes.error,
-              objErr: objRes.error,
+              supabaseErr: sbRes.ok === false ? sbRes.error : undefined,
+              objErr: objRes.ok === false ? objRes.error : undefined,
               err: e instanceof Error ? e.message : String(e),
             },
           );

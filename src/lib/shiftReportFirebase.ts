@@ -9,7 +9,7 @@ import {
 import { getBlob, getDownloadURL, ref, uploadBytes, deleteObject } from "firebase/storage";
 import { auth, db, storage } from "../firebase";
 import type { ShiftReport, Team, UserProfile } from "../types";
-import { apiFetch, apiFetchExternal, getApiBaseUrl, getExternalApiBaseUrl } from "./apiClient";
+import { apiFetch, apiFetchExternal, apiFetchShiftReport, getApiBaseUrl, getExternalApiBaseUrl } from "./apiClient";
 import { Capacitor } from "@capacitor/core";
 import { setDocClean, updateDocClean } from "./firestoreData";
 
@@ -276,7 +276,7 @@ export async function resolveShiftReportPdfBlob(r: ShiftReport): Promise<Blob> {
   const u = auth.currentUser;
   if (!u) throw new Error("Sessão expirada.");
   const token = await u.getIdToken();
-  const resp = await apiFetch(`/api/shift-reports/file/${encodeURIComponent(r.id)}`, {
+  const resp = await apiFetchShiftReport(`/api/shift-reports/file/${encodeURIComponent(r.id)}`, {
     method: "GET",
     headers: { Authorization: `Bearer ${token}` },
   });
