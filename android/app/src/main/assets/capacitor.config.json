@@ -1,9 +1,0 @@
-{
-	"appId": "com.sigmagcm.app",
-	"appName": "SIGMA-GCM",
-	"webDir": "dist",
-	"server": {
-		"androidScheme": "http",
-		"hostname": "localhost"
-	}
-}
