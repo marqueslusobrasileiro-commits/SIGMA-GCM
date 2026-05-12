@@ -191,6 +191,8 @@ export interface ShiftReport {
   createdAt: string;
   filename: string;
   downloadUrl?: string;
+  /** URL pública do PDF no Supabase Storage (ex.: bucket sigma-pdfs). */
+  publicUrl?: string;
   storagePath?: string;
   agentId: string;
   agentName: string;
@@ -201,12 +203,21 @@ export interface ShiftReport {
   shift: string;
   windowStart: string;
   windowEnd: string;
-  delivery?: 'storage' | 'server' | 'email' | 'none' | 'metadata_only' | 'firebase_storage';
+  delivery?:
+    | 'storage'
+    | 'server'
+    | 'email'
+    | 'none'
+    | 'metadata_only'
+    | 'firebase_storage'
+    | 'supabase';
   /** Quando só há registro no Firestore (ex.: Storage não disponível no plano Spark). */
   pdfNote?: string;
-  /** PDF persistido no Firebase Storage (upload via API Render). */
+  /** PDF persistido (Firebase Storage ou Supabase, conforme `delivery`). */
   uploaded?: boolean;
   firebaseStorageBucket?: string;
+  /** Bucket Supabase quando `delivery === 'supabase'`. */
+  supabaseStorageBucket?: string;
   generatedAt?: string;
   uploadedAt?: string;
   emailTo?: string;

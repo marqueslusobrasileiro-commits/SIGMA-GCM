@@ -11,8 +11,8 @@ export type SupabaseStorageConfig = {
 export function getSupabaseStorageConfigFromEnv(): SupabaseStorageConfig | null {
   const url = envStr("SUPABASE_URL");
   const serviceRoleKey = envStr("SUPABASE_SERVICE_ROLE_KEY");
-  const bucket = envStr("SUPABASE_STORAGE_BUCKET");
-  if (!url || !serviceRoleKey || !bucket) return null;
+  const bucket = envStr("SUPABASE_STORAGE_BUCKET") || "sigma-pdfs";
+  if (!url || !serviceRoleKey) return null;
   return { url, serviceRoleKey, bucket };
 }
 

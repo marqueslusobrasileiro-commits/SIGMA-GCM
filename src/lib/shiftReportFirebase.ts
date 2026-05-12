@@ -9,7 +9,7 @@ import {
 import { getBlob, getDownloadURL, ref, uploadBytes, deleteObject } from "firebase/storage";
 import { auth, db, storage } from "../firebase";
 import type { ShiftReport, Team, UserProfile } from "../types";
-import { apiFetch, apiFetchExternal, apiFetchShiftReport, getApiBaseUrl, getExternalApiBaseUrl } from "./apiClient";
+import { apiFetch, apiFetchExternal, apiFetchShiftReport, getApiBaseUrl, getExternalApiBaseUrl, shiftReportsApiShouldUseExternal } from "./apiClient";
 import { Capacitor } from "@capacitor/core";
 import { setDocClean, updateDocClean } from "./firestoreData";
 
@@ -20,6 +20,27 @@ function buildRelatorioStoragePath(uid: string, reportId: string, windowStartIso
   const yyyy = t.getUTCFullYear();
   const mm = String(t.getUTCMonth() + 1).padStart(2, "0");
   return `relatorios/${yyyy}/${mm}/${uid}/${reportId}.pdf`;
+}
+
+function isLikelySupabasePublicUrl(url: string): boolean {
+  return /\.supabase\.co\//i.test(url) || /\/storage\/v1\/object\/public\//i.test(url);
+}
+
+async function pdfBlobToBase64(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const result = String(reader.result || "");
+        const comma = result.indexOf(",");
+        resolve(comma >= 0 ? result.slice(comma + 1) : result);
+      } catch (e) {
+        reject(e);
+      }
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(blob);
+  });
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
@@ -50,10 +71,10 @@ function assertReportOwner(existing: unknown, profile: UserProfile, reportId: st
   }
 }
 
-/** Caminho no Firebase Storage (doc explícito, layout novo ou legado). */
+/** Caminho no Firebase Storage (doc explícito, layout novo ou legado). Não usar `storagePath` do Supabase no cliente Firebase. */
 export function inferShiftReportStoragePath(r: ShiftReport): string | null {
   const explicit = r.storagePath?.trim();
-  if (explicit) return explicit;
+  if (explicit && r.delivery !== "supabase") return explicit;
   const uid = r.agentId?.trim();
   const id = r.id?.trim();
   const ws = r.windowStart?.trim();
@@ -65,10 +86,11 @@ export function inferShiftReportStoragePath(r: ShiftReport): string | null {
 /** Há como obter o blob do PDF (URL, Storage explícito, caminho inferido ou API). */
 export function shiftReportHasResolvablePdfSource(r: ShiftReport): boolean {
   if (r.delivery === "metadata_only") return false;
+  if (r.publicUrl?.trim()) return true;
   if (r.downloadUrl?.trim()) return true;
   if (r.storagePath?.trim()) return true;
   if (inferShiftReportStoragePath(r)) return true;
-  return !!getApiBaseUrl();
+  return !!getApiBaseUrl() || Capacitor.isNativePlatform();
 }
 
 /** ID determinístico igual ao esperado pelo servidor (evita duplicar mesmo plantão). */
@@ -119,7 +141,7 @@ export async function registerShiftReportMetadataFirestore(opts: {
           delivery: "metadata_only",
           pdfNote:
             pdfNote ||
-            "PDF não armazenado: Firebase Storage indisponível (plano Spark) ou erro de upload. Configure Blaze/API ou gere o PDF pela web com servidor.",
+            "PDF não armazenado: configure o servidor com Supabase (SUPABASE_*) ou Firebase Storage (Blaze) e gere de novo pela web/API.",
         },
         { merge: true },
       ),
@@ -144,7 +166,7 @@ export async function registerShiftReportMetadataFirestore(opts: {
       delivery: "metadata_only",
       pdfNote:
         pdfNote ||
-        "PDF não armazenado: Firebase Storage indisponível (plano Spark) ou erro de upload. Configure Blaze/API ou gere o PDF pela web com servidor.",
+        "PDF não armazenado: configure o servidor com Supabase (SUPABASE_*) ou Firebase Storage (Blaze) e gere de novo pela web/API.",
     }),
     22_000,
     "Firestore (metadados do relatório)",
@@ -162,6 +184,52 @@ export async function uploadShiftReportPdfToFirebase(opts: {
 }): Promise<void> {
   const { profile, blob, filename, windowStart, windowEnd, shift, team } = opts;
   const reportId = buildShiftReportDocId(profile, windowStart);
+
+  if (shiftReportsApiShouldUseExternal() || getApiBaseUrl()) {
+    const u = auth.currentUser;
+    if (!u) throw new Error("Sessão expirada.");
+    const base64 = await pdfBlobToBase64(blob);
+    const token = await u.getIdToken();
+    // eslint-disable-next-line no-console
+    console.info("[shift_report_supabase] client upload → API", { reportId, filename });
+    const resp = await apiFetchShiftReport("/api/shift-reports/upload", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        filename,
+        pdfBase64: base64,
+        meta: {
+          agentId: profile.uid,
+          agentName: profile.name,
+          registration: profile.registration,
+          teamId: profile.teamId,
+          teamName: team?.name || "",
+          vehiclePrefix: team?.vehiclePrefix || "",
+          shift,
+          windowStart,
+          windowEnd,
+          reportId,
+        },
+      }),
+    });
+    const raw = await resp.text();
+    let payload: { ok?: boolean; error?: string; delivery?: string } = {};
+    try {
+      payload = raw ? (JSON.parse(raw) as typeof payload) : {};
+    } catch {
+      /* ignore */
+    }
+    if (!resp.ok) {
+      throw new Error(payload?.error || `Falha ao enviar PDF (HTTP ${resp.status}).`);
+    }
+    // eslint-disable-next-line no-console
+    console.info("[shift_report_supabase] client upload ok", { reportId, delivery: payload?.delivery });
+    return;
+  }
+
   const storagePath = buildRelatorioStoragePath(profile.uid, reportId, windowStart);
   const sRef = ref(storage, storagePath);
   await withTimeout(
@@ -181,23 +249,23 @@ export async function uploadShiftReportPdfToFirebase(opts: {
     setDocClean(
       doc(db, "shift_reports", reportId),
       {
-      createdAt: new Date().toISOString(),
-      filename,
-      downloadUrl,
-      storagePath,
-      agentId: profile.uid,
-      agentName: profile.name,
-      registration: profile.registration || "",
-      teamId: profile.teamId || "",
-      teamName: team?.name || "",
-      vehiclePrefix: team?.vehiclePrefix || "",
-      shift,
-      windowStart,
-      windowEnd,
-      delivery: "firebase_storage",
-      uploaded: true,
-      uploadedAt: new Date().toISOString(),
-      generatedAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        filename,
+        downloadUrl,
+        storagePath,
+        agentId: profile.uid,
+        agentName: profile.name,
+        registration: profile.registration || "",
+        teamId: profile.teamId || "",
+        teamName: team?.name || "",
+        vehiclePrefix: team?.vehiclePrefix || "",
+        shift,
+        windowStart,
+        windowEnd,
+        delivery: "firebase_storage",
+        uploaded: true,
+        uploadedAt: new Date().toISOString(),
+        generatedAt: new Date().toISOString(),
       },
       { merge: true },
     ),
@@ -213,6 +281,37 @@ async function ensurePdfBlob(blob: Blob): Promise<Blob> {
     throw new Error("Arquivo recebido não parece ser um PDF válido.");
   }
   return blob;
+}
+
+async function fetchShiftReportPdfFromApiBlob(r: ShiftReport): Promise<Blob> {
+  const u = auth.currentUser;
+  if (!u) throw new Error("Sessão expirada.");
+  const token = await u.getIdToken();
+  const resp = await apiFetchShiftReport(`/api/shift-reports/file/${encodeURIComponent(r.id)}`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(text || `Falha ao baixar PDF (HTTP ${resp.status})`);
+  }
+  const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+  const blob = await resp.blob();
+  if (!contentType.includes("application/pdf")) {
+    const txt = await blob.text().catch(() => "");
+    try {
+      const parsed = JSON.parse(txt);
+      const msg = typeof parsed?.error === "string" ? parsed.error : txt;
+      throw new Error(msg || `Resposta inválida (${contentType})`);
+    } catch (e) {
+      if (e instanceof Error && e.message !== txt) throw e;
+      throw new Error(
+        (txt && txt.slice(0, 300)) ||
+          `Resposta inválida do servidor (Content-Type: ${contentType || "?"})`,
+      );
+    }
+  }
+  return ensurePdfBlob(blob);
 }
 
 /** Baixa o PDF do relatório: URL pública/tokenizada → Storage → API (se configurada). */
@@ -252,6 +351,15 @@ export async function resolveShiftReportPdfBlob(r: ShiftReport): Promise<Blob> {
     }
   }
 
+  const publicUrl = r.publicUrl?.trim();
+  if (publicUrl && /^https?:\/\//i.test(publicUrl) && isLikelySupabasePublicUrl(publicUrl)) {
+    const resp = await withTimeout(fetch(publicUrl), 22_000, "Baixar PDF (Supabase URL pública)");
+    if (resp.ok) {
+      const blob = await resp.blob();
+      return ensurePdfBlob(blob);
+    }
+  }
+
   const url = r.downloadUrl?.trim();
   if (url && /^https?:\/\//i.test(url)) {
     const resp = await withTimeout(fetch(url), 22_000, "Baixar PDF (URL)");
@@ -262,15 +370,19 @@ export async function resolveShiftReportPdfBlob(r: ShiftReport): Promise<Blob> {
     return ensurePdfBlob(blob);
   }
 
+  if (r.delivery === "supabase" && (shiftReportsApiShouldUseExternal() || getApiBaseUrl())) {
+    return await fetchShiftReportPdfFromApiBlob(r);
+  }
+
   const path = r.storagePath?.trim();
-  if (path) {
+  if (path && r.delivery !== "supabase") {
     const sRef = ref(storage, path);
     const blob = await withTimeout(getBlob(sRef), 14_000, "Storage (PDF)");
     return ensurePdfBlob(blob);
   }
 
   const inferred = inferShiftReportStoragePath(r);
-  if (inferred) {
+  if (inferred && r.delivery !== "supabase") {
     try {
       const sRef = ref(storage, inferred);
       const blob = await withTimeout(getBlob(sRef), 14_000, "Storage (PDF inferido)");
@@ -280,43 +392,15 @@ export async function resolveShiftReportPdfBlob(r: ShiftReport): Promise<Blob> {
     }
   }
 
-  const base = getApiBaseUrl();
-  if (!base) {
+  if (!getApiBaseUrl() && !shiftReportsApiShouldUseExternal()) {
     throw new Error(
       r.delivery === "metadata_only"
-        ? "Este plantão foi registrado só com dados (sem PDF no Firebase). Com Storage ou API configurados, novos relatórios terão arquivo para baixar."
-        : "Não foi possível localizar o PDF (URL, Storage nem caminho padrão). Gere de novo no app atualizado ou defina VITE_API_BASE_URL se usar API.",
+        ? "Este plantão foi registrado só com dados (sem PDF). Configure Supabase/API no servidor ou Firebase Storage (Blaze)."
+        : "Não foi possível localizar o PDF (URL, Storage nem API). Gere de novo no app ou defina VITE_API_BASE_URL / VITE_EXTERNAL_API_BASE_URL.",
     );
   }
 
-  const u = auth.currentUser;
-  if (!u) throw new Error("Sessão expirada.");
-  const token = await u.getIdToken();
-  const resp = await apiFetchShiftReport(`/api/shift-reports/file/${encodeURIComponent(r.id)}`, {
-    method: "GET",
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  if (!resp.ok) {
-    const text = await resp.text().catch(() => "");
-    throw new Error(text || `Falha ao baixar PDF (HTTP ${resp.status})`);
-  }
-  const contentType = (resp.headers.get("content-type") || "").toLowerCase();
-  const blob = await resp.blob();
-  if (!contentType.includes("application/pdf")) {
-    const txt = await blob.text().catch(() => "");
-    try {
-      const parsed = JSON.parse(txt);
-      const msg = typeof parsed?.error === "string" ? parsed.error : txt;
-      throw new Error(msg || `Resposta inválida (${contentType})`);
-    } catch (e) {
-      if (e instanceof Error && e.message !== txt) throw e;
-      throw new Error(
-        (txt && txt.slice(0, 300)) ||
-          `Resposta inválida do servidor (Content-Type: ${contentType || "?"})`,
-      );
-    }
-  }
-  return ensurePdfBlob(blob);
+  return await fetchShiftReportPdfFromApiBlob(r);
 }
 
 export async function trashShiftReportFirestore(reportId: string): Promise<void> {
@@ -336,19 +420,21 @@ export async function restoreShiftReportFirestore(reportId: string): Promise<voi
 }
 
 export async function purgeShiftReportFirestore(r: ShiftReport): Promise<void> {
-  const paths = new Set<string>();
-  const p0 = r.storagePath?.trim();
-  if (p0) paths.add(p0);
-  const inferred = inferShiftReportStoragePath(r);
-  if (inferred) paths.add(inferred);
-  const legacy =
-    r.agentId?.trim() && r.id?.trim() ? `shift_reports/${r.agentId.trim()}/${r.id.trim()}.pdf` : "";
-  if (legacy) paths.add(legacy);
-  for (const path of paths) {
-    try {
-      await deleteObject(ref(storage, path));
-    } catch {
-      /* já removido ou sem permissão */
+  if (r.delivery !== "supabase") {
+    const paths = new Set<string>();
+    const p0 = r.storagePath?.trim();
+    if (p0) paths.add(p0);
+    const inferred = inferShiftReportStoragePath(r);
+    if (inferred) paths.add(inferred);
+    const legacy =
+      r.agentId?.trim() && r.id?.trim() ? `shift_reports/${r.agentId.trim()}/${r.id.trim()}.pdf` : "";
+    if (legacy) paths.add(legacy);
+    for (const path of paths) {
+      try {
+        await deleteObject(ref(storage, path));
+      } catch {
+        /* já removido ou sem permissão */
+      }
     }
   }
   await deleteDoc(doc(db, "shift_reports", r.id));
