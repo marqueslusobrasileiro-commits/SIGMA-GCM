@@ -59,6 +59,11 @@ import { sharePdfBlob } from '../lib/nativePdf';
 import { addDocClean, setDocClean, updateDocClean } from '../lib/firestoreData';
 import appLogo from '../assets/sigma-brand.png';
 
+function formatUserFacingError(message: string, maxLen = 320): string {
+  const line = String(message || '').trim().split(/\n/)[0] || 'Erro desconhecido.';
+  return line.length > maxLen ? `${line.slice(0, maxLen)}…` : line;
+}
+
 function patrolTimestampIsoFromFirestore(data: Record<string, unknown>): string {
   const raw = data.timestamp;
   if (raw instanceof Timestamp) return raw.toDate().toISOString();
@@ -1334,7 +1339,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                                               Capacitor.isNativePlatform() && msg.toLowerCase().includes('failed to fetch')
                                                 ? `\n\nDiagnóstico:\n- apiBaseUrl: ${base || '(null)'}\n- origin: ${window.location.origin}`
                                                 : '';
-                                            alert(`Não foi possível baixar o PDF.\n\nDetalhes: ${msg}${extra}`);
+                                            alert(`Não foi possível baixar o PDF.\n\n${formatUserFacingError(msg)}${extra}`);
                                           }
                                         }}
                                         className={[
@@ -1376,7 +1381,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                                               Capacitor.isNativePlatform() && msg.toLowerCase().includes('failed to fetch')
                                                 ? `\n\nDiagnóstico:\n- apiBaseUrl: ${base || '(null)'}\n- origin: ${window.location.origin}`
                                                 : '';
-                                            alert(`Não foi possível abrir para impressão.\n\nDetalhes: ${msg}${extra}`);
+                                            alert(`Não foi possível abrir para impressão.\n\n${formatUserFacingError(msg)}${extra}`);
                                           }
                                         }}
                                         className={[
@@ -1435,7 +1440,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                                               typeof payload?.emailTo === 'string' && payload.emailTo.trim()
                                                 ? payload.emailTo.trim()
                                                 : 'o endereço configurado em ADMIN_EMAIL no servidor';
-                                            alert(`E-mail enviado para:\n${dest}\n\nConfira também a pasta Spam/Lixo eletrônico.`);
+                                            alert(`Relatório enviado com sucesso.\n\nDestino: ${dest}\n\nConfira também a pasta Spam/Lixo eletrônico.`);
                                           } catch (e) {
                                             console.error(e);
                                             if (Capacitor.isNativePlatform() && isShareCanceledError(e)) return;
@@ -1447,7 +1452,9 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                                               msg.toLowerCase().includes('failed to fetch')
                                                 ? `\n\nDiagnóstico:\n- externalApiBaseUrl: ${ext}\n- apiBaseUrl: ${base || '(null)'}\n- origin: ${window.location.origin}`
                                                 : '';
-                                            alert(`Não foi possível enviar por e-mail.\n\nDetalhes: ${msg}${extra}`);
+                                            alert(
+                                              `Não foi possível enviar o relatório por e-mail.\n\n${formatUserFacingError(msg)}${extra}`,
+                                            );
                                           } finally {
                                             markSendingEmail(r.id, false);
                                           }

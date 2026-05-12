@@ -201,9 +201,14 @@ export interface ShiftReport {
   shift: string;
   windowStart: string;
   windowEnd: string;
-  delivery?: 'storage' | 'server' | 'email' | 'none' | 'metadata_only';
+  delivery?: 'storage' | 'server' | 'email' | 'none' | 'metadata_only' | 'firebase_storage';
   /** Quando só há registro no Firestore (ex.: Storage não disponível no plano Spark). */
   pdfNote?: string;
+  /** PDF persistido no Firebase Storage (upload via API Render). */
+  uploaded?: boolean;
+  firebaseStorageBucket?: string;
+  generatedAt?: string;
+  uploadedAt?: string;
   emailTo?: string;
   emailSentAt?: string;
   deletedAt?: string | null;

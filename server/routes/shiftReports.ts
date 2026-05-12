@@ -1,10 +1,7 @@
 import type express from "express";
-import fs from "node:fs/promises";
-import path from "node:path";
 import nodemailer from "nodemailer";
+import { FieldValue } from "firebase-admin/firestore";
 import { db, storageBucket } from "../lib/firebaseAdmin";
-import { getPdfObject, putPdfObject } from "../lib/objectStorage";
-import { getPdfSupabase, putPdfSupabase } from "../lib/supabaseStorage";
 import { requireFirebaseAuth } from "../lib/httpAuth";
 
 function getMailTransportIfConfigured() {
@@ -69,214 +66,114 @@ function isMasterAdmin(access: { role?: string; status?: string; email?: string 
   return isAdmin(access) && String(access.email || "").toLowerCase() === "andersonf.g.marques@gmail.com";
 }
 
-async function ensureUploadDir() {
-  const dir = path.resolve(process.cwd(), "server", "uploads", "shift_reports");
-  await fs.mkdir(dir, { recursive: true });
-  return dir;
+/** Caminho canónico no bucket: relatorios/AAAA/MM/uid/reportId.pdf */
+function buildRelatorioStoragePath(uid: string, reportId: string, windowStartIso: string): string {
+  const d = new Date(windowStartIso);
+  const t = Number.isNaN(d.getTime()) ? new Date() : d;
+  const yyyy = t.getUTCFullYear();
+  const mm = String(t.getUTCMonth() + 1).padStart(2, "0");
+  return `relatorios/${yyyy}/${mm}/${uid}/${reportId}.pdf`;
 }
 
-function inferStoragePathFromDoc(opts: { reportId: string; data: any }): string | null {
-  const { reportId, data } = opts;
-  const explicit = String(data?.storagePath || "").trim();
-  if (explicit) return explicit;
+/** Ordem: path explícito no doc → layout novo (inferido) → legado shift_reports/ */
+function collectCandidateStoragePaths(reportId: string, data: any): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (p: string) => {
+    const t = String(p || "").trim();
+    if (!t || seen.has(t)) return;
+    seen.add(t);
+    out.push(t);
+  };
+
+  add(String(data?.storagePath || ""));
   const agentId = String(data?.agentId || "").trim();
-  if (agentId) return `shift_reports/${agentId}/${reportId}.pdf`;
-  return null;
+  const ws = String(data?.windowStart || "").trim();
+  if (agentId) {
+    if (ws) add(buildRelatorioStoragePath(agentId, reportId, ws));
+    add(`shift_reports/${agentId}/${reportId}.pdf`);
+  }
+  return out;
 }
 
-function inferObjectKeyFromDoc(opts: { reportId: string; data: any }): string | null {
+function isLikelyFirebaseStorageHttpsUrl(url: string): boolean {
+  return /firebasestorage\.googleapis\.com|\.appspot\.com|\.firebasestorage\.app/i.test(url);
+}
+
+/**
+ * Obtém o PDF apenas via Firebase Storage (Admin SDK) ou URL HTTPS do próprio Firebase (token).
+ */
+async function downloadShiftReportPdfBuffer(opts: { reportId: string; data: any }): Promise<Buffer | null> {
   const { reportId, data } = opts;
-  const explicit = String(data?.objectKey || "").trim();
-  if (explicit) return explicit;
-  const agentId = String(data?.agentId || "").trim();
-  if (agentId) return `shift_reports/${agentId}/${reportId}.pdf`;
-  return null;
-}
+  const bucketName = storageBucket.name || "(default)";
 
-function inferSupabasePathFromDoc(opts: { reportId: string; data: any }): string | null {
-  const { reportId, data } = opts;
-  const explicit = String(data?.supabasePath || "").trim();
-  if (explicit) return explicit;
-  const agentId = String(data?.agentId || "").trim();
-  if (agentId) return `shift_reports/${agentId}/${reportId}.pdf`;
-  return null;
-}
-
-async function tryReadPdfFromSupabase(opts: { reportId: string; data: any }): Promise<Buffer | null> {
-  const p = inferSupabasePathFromDoc(opts);
-  if (!p) return null;
-  const res = await getPdfSupabase({ path: p });
-  if (res.ok === false) {
-    // eslint-disable-next-line no-console
-    console.warn("[shift-reports] supabase storage fallback failed", {
-      reportId: opts.reportId,
-      path: p,
-      err: res.error,
-    });
-    return null;
-  }
-  return res.pdf;
-}
-
-async function tryReadPdfFromObjectStorage(opts: { reportId: string; data: any }): Promise<Buffer | null> {
-  const key = inferObjectKeyFromDoc(opts);
-  if (!key) return null;
-  const res = await getPdfObject({ key });
-  if (res.ok === false) {
-    // eslint-disable-next-line no-console
-    console.warn("[shift-reports] object storage fallback failed", {
-      reportId: opts.reportId,
-      key,
-      err: res.error,
-    });
-    return null;
-  }
-  return res.pdf;
-}
-
-async function tryReadPdfFromStorage(opts: { reportId: string; data: any }): Promise<Buffer | null> {
-  const storagePath = inferStoragePathFromDoc(opts);
-  if (!storagePath) return null;
-  try {
-    const [buf] = await storageBucket.file(storagePath).download();
-    if (!buf?.length) return null;
-    return buf;
-  } catch (e) {
-    // eslint-disable-next-line no-console
-    console.warn("[shift-reports] storage fallback failed", {
-      reportId: opts.reportId,
-      storagePath,
-      err: e instanceof Error ? e.message : String(e),
-    });
-    return null;
-  }
-}
-
-function absolutizeDownloadUrl(downloadUrl: string, req?: express.Request): string | null {
-  const u = String(downloadUrl || "").trim();
-  if (!u) return null;
-  if (/^https?:\/\//i.test(u)) return u;
-
-  const envBase = String(process.env.RENDER_EXTERNAL_URL || "").trim().replace(/\/$/, "");
-  const reqBase =
-    req && req.get("host")
-      ? `${String(req.headers["x-forwarded-proto"] || req.protocol || "https").split(",")[0].trim() || "https"}://${req.get("host")}`.replace(
-          /\/$/,
-          "",
-        )
-      : "";
-
-  const base = (envBase || reqBase).replace(/\/$/, "");
-  if (!base) return null;
-  if (!u.startsWith("/")) return `${base}/${u}`;
-  return `${base}${u}`;
-}
-
-/** PDF sem depender de `localPath` (ex.: disco efémero no Render limpou o ficheiro, mas o doc tem `supabasePath`). */
-async function tryReadPdfFromCloudOrExternalDownloadUrl(opts: {
-  reportId: string;
-  data: any;
-  req?: express.Request;
-}): Promise<Buffer | null> {
-  const { reportId, data, req } = opts;
-  const fromSb = await tryReadPdfFromSupabase({ reportId, data });
-  if (fromSb?.length) return fromSb;
-  const fromObj = await tryReadPdfFromObjectStorage({ reportId, data });
-  if (fromObj?.length) return fromObj;
-  const fromStorage = await tryReadPdfFromStorage({ reportId, data });
-  if (fromStorage?.length) return fromStorage;
-
-  const downloadAbs = absolutizeDownloadUrl(String(data?.downloadUrl || ""), req);
-  if (!downloadAbs || !/^https?:\/\//i.test(downloadAbs)) return null;
-  const selfPrefix = `/api/shift-reports/file/${encodeURIComponent(reportId)}`;
-  const isSelf =
-    downloadAbs.endsWith(selfPrefix) ||
-    downloadAbs.includes(`/api/shift-reports/file/${encodeURIComponent(reportId)}`);
-  if (isSelf) return null;
-  try {
-    const resp = await fetch(downloadAbs, { method: "GET" });
-    if (!resp.ok) return null;
-    const buf = Buffer.from(await resp.arrayBuffer());
-    return buf.length ? buf : null;
-  } catch {
-    return null;
-  }
-}
-
-async function readPdfBufferForEmail(opts: {
-  reportId: string;
-  data: any;
-  authHeader: string | undefined;
-  req?: express.Request;
-}): Promise<Buffer> {
-  const { reportId, data, authHeader, req } = opts;
-
-  const filePath = String(data?.localPath || "").trim();
-  if (filePath) {
+  for (const storagePath of collectCandidateStoragePaths(reportId, data)) {
     try {
-      return await fs.readFile(filePath);
-    } catch (e: any) {
-      const code = e?.code as string | undefined;
-      if (code !== "ENOENT") throw e;
+      const [buf] = await storageBucket.file(storagePath).download();
+      if (buf?.length) {
+        // eslint-disable-next-line no-console
+        console.log("[shift-reports] PDF obtido do Firebase Storage", {
+          reportId,
+          bucket: bucketName,
+          storagePath,
+          bytes: buf.length,
+        });
+        return buf;
+      }
+    } catch (e) {
       // eslint-disable-next-line no-console
-      console.warn("[shift-reports] localPath missing on disk; will try downloadUrl fallback", {
+      console.warn("[shift-reports] tentativa Storage falhou", {
         reportId,
-        filePath,
+        storagePath,
+        err: e instanceof Error ? e.message : String(e),
       });
     }
   }
 
-  // Mesma ordem que GET /api/shift-reports/file/:id — evita fetch HTTP à própria API
-  // (disco efémero → 500 "file read failed") quando o PDF existe no armazenamento persistente.
-  const fromSb = await tryReadPdfFromSupabase({ reportId, data });
-  if (fromSb?.length) return fromSb;
-
-  const fromObj = await tryReadPdfFromObjectStorage({ reportId, data });
-  if (fromObj?.length) return fromObj;
-
-  const fromStorage = await tryReadPdfFromStorage({ reportId, data });
-  if (fromStorage?.length) return fromStorage;
-
-  const downloadAbs = absolutizeDownloadUrl(String(data?.downloadUrl || ""), req);
-  if (downloadAbs) {
-    const selfPrefix = `/api/shift-reports/file/${encodeURIComponent(reportId)}`;
-    const isSelf =
-      downloadAbs.endsWith(selfPrefix) ||
-      downloadAbs.includes(`/api/shift-reports/file/${encodeURIComponent(reportId)}`);
-    // Evita fetch à própria API (quase sempre 500 com disco efémero) quando já não há PDF em lado nenhum.
-    if (isSelf) {
-      throw new Error(
-        "PDF indisponível: não está no disco deste servidor nem foi encontrado em Supabase, Object Storage nem Firebase Storage. " +
-          "Confirme que a API em produção está atualizada (último código), que SUPABASE_* / S3 / Firebase estão bem configurados no servidor e, se for preciso, peça ao agente para voltar a subir o relatório a partir do app.",
-      );
+  const url = String(data?.downloadUrl || "").trim();
+  if (url && /^https?:\/\//i.test(url) && isLikelyFirebaseStorageHttpsUrl(url)) {
+    try {
+      const resp = await fetch(url, { method: "GET" });
+      if (resp.ok) {
+        const buf = Buffer.from(await resp.arrayBuffer());
+        if (buf.length) {
+          // eslint-disable-next-line no-console
+          console.log("[shift-reports] PDF obtido por downloadUrl (HTTPS Firebase)", {
+            reportId,
+            bytes: buf.length,
+          });
+          return buf;
+        }
+      }
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn("[shift-reports] fetch downloadUrl falhou", {
+        reportId,
+        err: e instanceof Error ? e.message : String(e),
+      });
     }
-
-    const resp = await fetch(downloadAbs, {
-      method: "GET",
-      headers: authHeader ? { Authorization: authHeader } : undefined,
-    });
-    if (!resp.ok) {
-      const txt = await resp.text().catch(() => "");
-      throw new Error(`Falha ao baixar PDF pela downloadUrl (HTTP ${resp.status}). ${txt}`.trim());
-    }
-    const buf = Buffer.from(await resp.arrayBuffer());
-    if (!buf.length) throw new Error("PDF baixado está vazio.");
-    return buf;
   }
 
+  return null;
+}
+
+async function readPdfBufferForEmail(opts: { reportId: string; data: any }): Promise<Buffer> {
+  const buf = await downloadShiftReportPdfBuffer(opts);
+  if (buf?.length) return buf;
   throw new Error(
-    "Arquivo do relatório não está disponível no servidor (disco efêmero) e não foi possível resolver downloadUrl para baixar o PDF. Reenvie o relatório (upload) ou verifique host/proxy do servidor.",
+    "Não foi possível obter o PDF no Firebase Storage. Confirme no Render: FIREBASE_SERVICE_ACCOUNT, " +
+      "FIREBASE_STORAGE_BUCKET (ou projectId para bucket default), plano Blaze ativo e regras do Storage. " +
+      "Relatórios muito antigos podem precisar de ser gerados de novo.",
   );
 }
 
 export function registerShiftReportRoutes(app: express.Express) {
-  // Upload obrigatório do relatório (PDF base64) para o servidor.
-  // O servidor salva o arquivo e registra/atualiza o documento em shift_reports com um downloadUrl.
   app.post("/api/shift-reports/upload", async (req, res) => {
     // eslint-disable-next-line no-console
     console.log("[shift-reports] upload request received", {
       hasAuth: !!req.headers.authorization,
       contentLength: req.headers["content-length"],
+      bucket: storageBucket.name,
     });
     const decoded = await requireFirebaseAuth(req, res);
     if (!decoded) return;
@@ -304,60 +201,57 @@ export function registerShiftReportRoutes(app: express.Express) {
     const docRef = reportId ? db.collection("shift_reports").doc(reportId) : db.collection("shift_reports").doc();
     const finalReportId = docRef.id;
 
-    const dir = await ensureUploadDir();
     const safeName = String(filename).replace(/[^\w.\-() ]/g, "_");
-    const filePath = path.join(dir, `${finalReportId}__${safeName}`);
     const buffer = Buffer.from(String(pdfBase64), "base64");
-    await fs.writeFile(filePath, buffer);
-
-    const downloadUrl = `/api/shift-reports/file/${encodeURIComponent(finalReportId)}`;
-    const storagePath = `shift_reports/${decoded.uid}/${finalReportId}.pdf`;
-    const objectKey = storagePath; // mesma convenção do Storage (facilita migração)
-    const supabasePath = storagePath; // mesma convenção
-
-    // Persistência (preferência): Supabase Storage (free tier).
-    const sbRes = await putPdfSupabase({ path: supabasePath, pdf: buffer });
-    if (!sbRes.ok) {
-      // Persistência (fallback): Object Storage S3-compatível (Backblaze B2 / R2).
-      const objRes = await putPdfObject({ key: objectKey, pdf: buffer, contentType: "application/pdf" });
-      if (!objRes.ok) {
-        // Último fallback: tenta Firebase Storage (se existir/provisionado).
-        try {
-          await storageBucket.file(storagePath).save(buffer, {
-            contentType: "application/pdf",
-            resumable: false,
-            metadata: {
-              cacheControl: "private, max-age=0, no-transform",
-            },
-          });
-        } catch (e) {
-          // eslint-disable-next-line no-console
-          console.warn(
-            "[shift-reports] upload: falha ao salvar no Supabase, Object Storage e Firebase Storage (continuando com localPath)",
-            {
-              reportId: finalReportId,
-              storagePath,
-              objectKey,
-              supabasePath,
-              supabaseErr: sbRes.ok === false ? sbRes.error : undefined,
-              objErr: objRes.ok === false ? objRes.error : undefined,
-              err: e instanceof Error ? e.message : String(e),
-            },
-          );
-        }
-      }
+    if (!buffer.length) {
+      return res.status(400).json({ error: "PDF vazio ou base64 inválido." });
     }
+
+    const agentId = String(meta?.agentId || decoded.uid).trim();
+    const windowStartIso = String(meta?.windowStart || new Date().toISOString());
+    const storagePath = buildRelatorioStoragePath(agentId, finalReportId, windowStartIso);
+    const downloadUrl = `/api/shift-reports/file/${encodeURIComponent(finalReportId)}`;
+
+    // eslint-disable-next-line no-console
+    console.log("[shift-reports] upload: gravando PDF no Firebase Storage", {
+      reportId: finalReportId,
+      bucket: storageBucket.name,
+      storagePath,
+      bytes: buffer.length,
+    });
+
+    try {
+      await storageBucket.file(storagePath).save(buffer, {
+        contentType: "application/pdf",
+        resumable: false,
+        metadata: {
+          cacheControl: "private, max-age=0, no-transform",
+          metadata: { reportId: finalReportId, agentId },
+        },
+      });
+    } catch (e) {
+      console.error("[shift-reports] upload: falha ao gravar no Firebase Storage", e);
+      return res.status(500).json({
+        error:
+          e instanceof Error
+            ? e.message
+            : "Falha ao gravar PDF no Firebase Storage. Verifique credenciais, bucket e plano Blaze.",
+      });
+    }
+
+    // eslint-disable-next-line no-console
+    console.log("[shift-reports] upload: Firestore merge", { reportId: finalReportId, downloadUrl });
 
     await docRef.set(
       {
         createdAt: new Date().toISOString(),
+        generatedAt: new Date().toISOString(),
         filename: safeName,
         downloadUrl,
         storagePath,
-        objectKey,
-        supabasePath,
-        localPath: filePath,
-        // Se esse reportId já existia e estava na lixeira, ao re-enviar deve voltar para "Ativos".
+        firebaseStorageBucket: storageBucket.name,
+        uploaded: true,
+        uploadedAt: new Date().toISOString(),
         deletedAt: null,
         deletedBy: null,
         agentId: meta?.agentId || decoded.uid,
@@ -369,15 +263,19 @@ export function registerShiftReportRoutes(app: express.Express) {
         shift: meta?.shift || "",
         windowStart: meta?.windowStart || "",
         windowEnd: meta?.windowEnd || "",
-        delivery: "server",
+        delivery: "firebase_storage",
+        localPath: FieldValue.delete(),
+        objectKey: FieldValue.delete(),
+        supabasePath: FieldValue.delete(),
       },
       { merge: true },
     );
 
-    res.json({ ok: true, reportId: finalReportId, downloadUrl });
+    // eslint-disable-next-line no-console
+    console.log("[shift-reports] upload: concluído com sucesso", { reportId: finalReportId });
+    res.json({ ok: true, reportId: finalReportId, downloadUrl, storagePath });
   });
 
-  // Download do PDF salvo no servidor.
   app.get("/api/shift-reports/file/:reportId", async (req, res) => {
     const decoded = await requireFirebaseAuth(req, res);
     if (!decoded) return;
@@ -388,145 +286,35 @@ export function registerShiftReportRoutes(app: express.Express) {
     }
 
     const reportId = String(req.params.reportId || "");
-    if (!reportId) return res.status(400).send("missing reportId");
+    if (!reportId) return res.status(400).json({ error: "missing reportId" });
 
     const snap = await db.collection("shift_reports").doc(reportId).get();
-    if (!snap.exists) return res.status(404).send("not found");
+    if (!snap.exists) return res.status(404).json({ error: "Relatório não encontrado." });
     const data = snap.data() as any;
 
     const ownerUid = String(data?.agentId || "");
     if (!isAdmin(access) && decoded.uid !== ownerUid) {
-      return res.status(403).send("forbidden");
+      return res.status(403).json({ error: "forbidden" });
     }
 
-    let filePath = String(data?.localPath || "");
-    if (!filePath) {
-      // Tentativa de recuperação: o cliente pode ter sobrescrito o doc e apagado o localPath.
-      // Procuramos por um arquivo salvo no padrão "<reportId>__<filename>".
-      try {
-        const dir = await ensureUploadDir();
-        const files = await fs.readdir(dir);
-        const match = files.find((f) => f.startsWith(`${reportId}__`));
-        if (match) {
-          filePath = path.join(dir, match);
-          await snap.ref.set(
-            {
-              localPath: filePath,
-              filename: match.split("__").slice(1).join("__") || data?.filename || "relatorio.pdf",
-              downloadUrl: `/api/shift-reports/file/${encodeURIComponent(reportId)}`,
-              delivery: "server",
-            },
-            { merge: true },
-          );
-        } else {
-          // Segunda tentativa: alguns docs antigos foram criados com ID aleatório (addDoc),
-          // mas o arquivo foi salvo com ID determinístico: "<agentId>_<teamId>_<windowStart>__...".
-          const agentId = String(data?.agentId || "");
-          const teamId = String(data?.teamId || "");
-          const windowStart = String(data?.windowStart || "");
-          const deterministicId =
-            agentId && teamId && windowStart
-              ? `${agentId}_${teamId}_${windowStart.replace(/[:.]/g, "-")}`
-              : "";
-          if (deterministicId) {
-            const match2 = files.find((f) => f.startsWith(`${deterministicId}__`));
-            if (match2) {
-              filePath = path.join(dir, match2);
-              await snap.ref.set(
-                {
-                  localPath: filePath,
-                  filename: match2.split("__").slice(1).join("__") || data?.filename || "relatorio.pdf",
-                  // mantém a URL do doc atual (id aleatório), mas passa a funcionar.
-                  downloadUrl: `/api/shift-reports/file/${encodeURIComponent(reportId)}`,
-                  delivery: "server",
-                },
-                { merge: true },
-              );
-            }
-          }
-        }
-      } catch (e) {
-        console.warn("[shift-reports] recovery failed", e);
-      }
-    }
-    if (!filePath) {
-      const cloudOnly = await tryReadPdfFromCloudOrExternalDownloadUrl({ reportId, data, req });
-      if (cloudOnly?.length) {
-        res.setHeader("Content-Type", "application/pdf");
-        res.setHeader("Content-Disposition", `inline; filename="${String(data?.filename || "relatorio.pdf")}"`);
-        return res.send(cloudOnly);
-      }
-      return res.status(404).send("file not available");
-    }
+    // eslint-disable-next-line no-console
+    console.log("[shift-reports] file GET", { reportId, bucket: storageBucket.name });
 
-    try {
-      const file = await fs.readFile(filePath);
-      res.setHeader("Content-Type", "application/pdf");
-      res.setHeader("Content-Disposition", `inline; filename="${String(data?.filename || "relatorio.pdf")}"`);
-      res.send(file);
-    } catch (e) {
-      console.error("[shift-reports] file read failed", e);
-
-      // Fallback 0 (preferido): Supabase Storage (free tier).
-      const fromSb = await tryReadPdfFromSupabase({ reportId, data });
-      if (fromSb?.length) {
-        res.setHeader("Content-Type", "application/pdf");
-        res.setHeader("Content-Disposition", `inline; filename="${String(data?.filename || "relatorio.pdf")}"`);
-        return res.send(fromSb);
-      }
-
-      // Fallback 0 (preferido): Object Storage (S3 compatível) — persistente e gratuito (B2/R2).
-      const fromObj = await tryReadPdfFromObjectStorage({ reportId, data });
-      if (fromObj?.length) {
-        res.setHeader("Content-Type", "application/pdf");
-        res.setHeader("Content-Disposition", `inline; filename="${String(data?.filename || "relatorio.pdf")}"`);
-        return res.send(fromObj);
-      }
-
-      // Fallback 1: Firebase Storage (persistente) via Admin SDK
-      const fromStorage = await tryReadPdfFromStorage({ reportId, data });
-      if (fromStorage?.length) {
-        res.setHeader("Content-Type", "application/pdf");
-        res.setHeader("Content-Disposition", `inline; filename="${String(data?.filename || "relatorio.pdf")}"`);
-        return res.send(fromStorage);
-      }
-
-      // Fallback: se o relatório veio do Firebase Storage (delivery=storage), o disco do Render não terá o arquivo.
-      // Tentamos baixar pelo `downloadUrl` absoluto quando ele NÃO aponta para esta mesma rota.
-      try {
-        const downloadAbs = absolutizeDownloadUrl(String(data?.downloadUrl || ""), req);
-        const selfPrefix = `/api/shift-reports/file/${encodeURIComponent(reportId)}`;
-        const isSelf =
-          !!downloadAbs &&
-          (downloadAbs.endsWith(selfPrefix) ||
-            downloadAbs.includes(`/api/shift-reports/file/${encodeURIComponent(reportId)}`));
-
-        if (downloadAbs && /^https?:\/\//i.test(downloadAbs) && !isSelf) {
-          // eslint-disable-next-line no-console
-          console.warn("[shift-reports] fallback downloadUrl", { reportId, downloadAbs });
-          const resp = await fetch(downloadAbs, { method: "GET" });
-          if (!resp.ok) {
-            const txt = await resp.text().catch(() => "");
-            throw new Error(`downloadUrl HTTP ${resp.status}. ${txt}`.trim());
-          }
-          const buf = Buffer.from(await resp.arrayBuffer());
-          if (!buf.length) throw new Error("downloadUrl retornou PDF vazio.");
-          res.setHeader("Content-Type", "application/pdf");
-          res.setHeader("Content-Disposition", `inline; filename="${String(data?.filename || "relatorio.pdf")}"`);
-          return res.send(buf);
-        }
-      } catch (fallbackErr) {
-        console.error("[shift-reports] fallback downloadUrl failed", fallbackErr);
-      }
-
-      res.status(500).json({
+    const buf = await downloadShiftReportPdfBuffer({ reportId, data });
+    if (!buf?.length) {
+      return res.status(404).json({
         error:
-          "PDF indisponível neste servidor (ficheiro em disco ausente) e não foi encontrado em Supabase, Object Storage nem Firebase Storage. Confirme SUPABASE_* no Render, ou peça um novo envio do relatório pelo app.",
+          "PDF não encontrado no Firebase Storage para este relatório. Gere novamente pelo app ou confira o bucket e o caminho no Firestore.",
       });
     }
+
+    // eslint-disable-next-line no-console
+    console.log("[shift-reports] file GET: enviando PDF", { reportId, bytes: buf.length });
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${String(data?.filename || "relatorio.pdf")}"`);
+    res.send(buf);
   });
 
-  // Mover para Lixeira (somente ADM MASTER). Não remove arquivo nem doc.
   app.post("/api/shift-reports/trash/:reportId", async (req, res) => {
     // eslint-disable-next-line no-console
     console.log("[shift-reports] trash request received", {
@@ -559,7 +347,6 @@ export function registerShiftReportRoutes(app: express.Express) {
     res.json({ ok: true });
   });
 
-  // Restaurar da Lixeira (somente ADM MASTER)
   app.post("/api/shift-reports/restore/:reportId", async (req, res) => {
     // eslint-disable-next-line no-console
     console.log("[shift-reports] restore request received", {
@@ -592,7 +379,6 @@ export function registerShiftReportRoutes(app: express.Express) {
     res.json({ ok: true });
   });
 
-  // Excluir definitivamente (somente ADM MASTER). Remove doc e arquivo local (se existir).
   app.delete("/api/shift-reports/purge/:reportId", async (req, res) => {
     // eslint-disable-next-line no-console
     console.log("[shift-reports] purge request received", {
@@ -615,13 +401,17 @@ export function registerShiftReportRoutes(app: express.Express) {
     if (!snap.exists) return res.status(404).json({ error: "Relatório não encontrado." });
     const data = snap.data() as any;
 
-    const filePath = String(data?.localPath || "");
-    if (filePath) {
+    for (const p of collectCandidateStoragePaths(reportId, data)) {
       try {
-        await fs.unlink(filePath);
-      } catch (e: any) {
+        await storageBucket.file(p).delete();
         // eslint-disable-next-line no-console
-        console.warn("[shift-reports] purge: falha ao remover arquivo local", { filePath, err: String(e?.message || e) });
+        console.log("[shift-reports] purge: objeto removido do Storage", { path: p });
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn("[shift-reports] purge: falha ao remover (pode já não existir)", {
+          path: p,
+          err: e instanceof Error ? e.message : String(e),
+        });
       }
     }
 
@@ -629,7 +419,6 @@ export function registerShiftReportRoutes(app: express.Express) {
     res.json({ ok: true });
   });
 
-  // Compatibilidade: DELETE antigo agora move para a lixeira.
   app.delete("/api/shift-reports/:reportId", async (req, res) => {
     const decoded = await requireFirebaseAuth(req, res);
     if (!decoded) return;
@@ -656,7 +445,6 @@ export function registerShiftReportRoutes(app: express.Express) {
     res.json({ ok: true });
   });
 
-  // Envio opcional por e-mail (somente ADM MASTER) usando o arquivo salvo no servidor.
   app.post("/api/shift-reports/send/:reportId", async (req, res) => {
     try {
       // eslint-disable-next-line no-console
@@ -688,12 +476,12 @@ export function registerShiftReportRoutes(app: express.Express) {
       if (!snap.exists) return res.status(404).json({ error: "Relatório não encontrado." });
       const data = snap.data() as any;
 
-      const buffer = await readPdfBufferForEmail({
-        reportId,
-        data,
-        authHeader: req.headers.authorization,
-        req,
-      });
+      // eslint-disable-next-line no-console
+      console.log("[shift-reports] send: obtendo PDF para anexo", { reportId });
+      const buffer = await readPdfBufferForEmail({ reportId, data });
+      // eslint-disable-next-line no-console
+      console.log("[shift-reports] send: PDF pronto, enviando SMTP", { reportId, bytes: buffer.length, to: adminEmail });
+
       const subject = `SIGMA-GCM - Relatório de Plantão (${data?.agentName || "-"})`;
       const text = [
         "Relatório de Plantão anexado.",
@@ -730,6 +518,8 @@ export function registerShiftReportRoutes(app: express.Express) {
         { merge: true },
       );
 
+      // eslint-disable-next-line no-console
+      console.log("[shift-reports] send: e-mail enviado com sucesso", { reportId, to: adminEmail });
       res.json({ ok: true, emailTo: adminEmail });
     } catch (err) {
       console.error("[shift-reports] send(manual) failed:", err);
@@ -738,14 +528,10 @@ export function registerShiftReportRoutes(app: express.Express) {
     }
   });
 
-  // Recebe um PDF (base64) e envia para o ADM MASTER por e-mail, gravando metadados no Firestore.
   app.post("/api/shift-reports/send", async (req, res) => {
-    // Essa rota era do fluxo antigo (envio automático por e-mail).
-    // Agora o fluxo correto é: /upload (obrigatório para o painel) + /send/:reportId (manual pelo ADM).
     return res.status(410).json({
       error:
         "Rota desativada. Use /api/shift-reports/upload para registrar no painel. O envio por e-mail é manual via /api/shift-reports/send/:reportId.",
     });
   });
 }
-

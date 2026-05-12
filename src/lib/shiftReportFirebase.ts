@@ -13,6 +13,15 @@ import { apiFetch, apiFetchExternal, apiFetchShiftReport, getApiBaseUrl, getExte
 import { Capacitor } from "@capacitor/core";
 import { setDocClean, updateDocClean } from "./firestoreData";
 
+/** Igual ao servidor: `relatorios/AAAA/MM/uid/reportId.pdf` */
+function buildRelatorioStoragePath(uid: string, reportId: string, windowStartIso: string): string {
+  const d = new Date(windowStartIso);
+  const t = Number.isNaN(d.getTime()) ? new Date() : d;
+  const yyyy = t.getUTCFullYear();
+  const mm = String(t.getUTCMonth() + 1).padStart(2, "0");
+  return `relatorios/${yyyy}/${mm}/${uid}/${reportId}.pdf`;
+}
+
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise((resolve, reject) => {
     const t = window.setTimeout(() => reject(new Error(`${label}: tempo esgotado (${ms} ms)`)), ms);
@@ -41,12 +50,16 @@ function assertReportOwner(existing: unknown, profile: UserProfile, reportId: st
   }
 }
 
-/** Caminho padrão do PDF quando upload foi feito pelo app (`uploadShiftReportPdfToFirebase`). */
+/** Caminho no Firebase Storage (doc explícito, layout novo ou legado). */
 export function inferShiftReportStoragePath(r: ShiftReport): string | null {
+  const explicit = r.storagePath?.trim();
+  if (explicit) return explicit;
   const uid = r.agentId?.trim();
   const id = r.id?.trim();
-  if (!uid || !id) return null;
-  return `shift_reports/${uid}/${id}.pdf`;
+  const ws = r.windowStart?.trim();
+  if (uid && id && ws) return buildRelatorioStoragePath(uid, id, ws);
+  if (uid && id) return `shift_reports/${uid}/${id}.pdf`;
+  return null;
 }
 
 /** Há como obter o blob do PDF (URL, Storage explícito, caminho inferido ou API). */
@@ -149,7 +162,7 @@ export async function uploadShiftReportPdfToFirebase(opts: {
 }): Promise<void> {
   const { profile, blob, filename, windowStart, windowEnd, shift, team } = opts;
   const reportId = buildShiftReportDocId(profile, windowStart);
-  const storagePath = `shift_reports/${profile.uid}/${reportId}.pdf`;
+  const storagePath = buildRelatorioStoragePath(profile.uid, reportId, windowStart);
   const sRef = ref(storage, storagePath);
   await withTimeout(
     uploadBytes(sRef, blob, { contentType: "application/pdf" }),
@@ -181,7 +194,10 @@ export async function uploadShiftReportPdfToFirebase(opts: {
       shift,
       windowStart,
       windowEnd,
-      delivery: "storage",
+      delivery: "firebase_storage",
+      uploaded: true,
+      uploadedAt: new Date().toISOString(),
+      generatedAt: new Date().toISOString(),
       },
       { merge: true },
     ),
@@ -320,12 +336,19 @@ export async function restoreShiftReportFirestore(reportId: string): Promise<voi
 }
 
 export async function purgeShiftReportFirestore(r: ShiftReport): Promise<void> {
-  const path = r.storagePath?.trim();
-  if (path) {
+  const paths = new Set<string>();
+  const p0 = r.storagePath?.trim();
+  if (p0) paths.add(p0);
+  const inferred = inferShiftReportStoragePath(r);
+  if (inferred) paths.add(inferred);
+  const legacy =
+    r.agentId?.trim() && r.id?.trim() ? `shift_reports/${r.agentId.trim()}/${r.id.trim()}.pdf` : "";
+  if (legacy) paths.add(legacy);
+  for (const path of paths) {
     try {
       await deleteObject(ref(storage, path));
     } catch {
-      /* arquivo já removido ou path antigo */
+      /* já removido ou sem permissão */
     }
   }
   await deleteDoc(doc(db, "shift_reports", r.id));

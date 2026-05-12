@@ -1457,8 +1457,8 @@ function App() {
           metadataOnly
             ? 'Plantão registrado no Painel (somente dados — sem PDF no Firebase).\n\nBaixar/Imprimir só funcionará com Storage (Blaze) ou API configurada (VITE_API_BASE_URL).'
             : usedFirebase
-              ? 'Relatório gerado e registrado no Firebase (Painel → Relatórios).'
-              : 'Relatório gerado e enviado automaticamente ao Painel do ADM!',
+              ? 'Relatório guardado no Firebase Storage e registado no painel (Relatórios).'
+              : 'Relatório gerado e enviado ao painel (PDF no servidor).',
         );
       } catch (sendErr) {
         console.error('Falha ao enviar relatório para o Painel do ADM:', sendErr);

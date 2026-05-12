@@ -36,6 +36,13 @@ service firebase.storage {
       allow delete: if isMasterEmailToken();
     }
 
+    // Relatórios (layout novo): relatorios/ANO/MES/uid/*.pdf
+    match /relatorios/{year}/{month}/{uid}/{allPaths=**} {
+      allow read: if isAdmin();
+      allow write: if isAtivo() && request.auth.uid == uid;
+      allow delete: if isMasterEmailToken();
+    }
+
     // Default: bloqueia todo o resto.
     match /{allPaths=**} {
       allow read, write: if false;
