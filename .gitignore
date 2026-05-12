@@ -2,6 +2,9 @@ node_modules/
 build/
 dist/
 coverage/
+
+# Exportações de pesquisa (Cursor / VS Code) — não commitar
+*.code-search
 .DS_Store
 *.log
 .env*
