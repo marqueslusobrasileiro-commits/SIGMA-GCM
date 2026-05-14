@@ -1,9 +1,14 @@
 const RESEND_API = "https://api.resend.com/emails";
 
+function resolveResendFrom(): string {
+  return String(
+    process.env.RESEND_FROM || process.env.EMAIL_FROM || process.env.SMTP_FROM || "",
+  ).trim();
+}
+
 export function isResendConfigured(): boolean {
   const key = String(process.env.RESEND_API_KEY || "").trim();
-  const from = String(process.env.RESEND_FROM || "").trim();
-
+  const from = resolveResendFrom();
   return !!(key && from);
 }
 
@@ -15,16 +20,15 @@ export async function sendEmailWithPdfViaResend(opts: {
   pdfBuffer: Buffer;
   reportId?: string;
 }): Promise<void> {
-
   const apiKey = String(process.env.RESEND_API_KEY || "").trim();
-  const from = String(process.env.RESEND_FROM || "").trim();
+  const from = resolveResendFrom();
 
   if (!apiKey) {
     throw new Error("RESEND_API_KEY não definido.");
   }
 
   if (!from) {
-    throw new Error("RESEND_FROM não definido.");
+    throw new Error("RESEND_FROM, EMAIL_FROM ou SMTP_FROM é obrigatório para Resend.");
   }
 
   const body = {
