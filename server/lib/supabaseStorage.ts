@@ -1,3 +1,5 @@
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+
 function envStr(name: string): string {
   return String(process.env[name] || "").trim();
 }
@@ -14,6 +16,33 @@ export function getSupabaseStorageConfigFromEnv(): SupabaseStorageConfig | null 
   const bucket = envStr("SUPABASE_STORAGE_BUCKET") || "sigma-pdfs";
   if (!url || !serviceRoleKey) return null;
   return { url, serviceRoleKey, bucket };
+}
+
+const _cfg0 = getSupabaseStorageConfigFromEnv();
+
+/**
+ * Cliente Supabase (service role) para Storage — URLs assinadas, etc.
+ * `null` se SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY não estiverem definidos.
+ */
+export const supabase: SupabaseClient | null = _cfg0
+  ? createClient(_cfg0.url, _cfg0.serviceRoleKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    })
+  : null;
+
+/** URL assinada (bucket privado) para download direto no browser. */
+export async function createSignedPdfUrl(objectPath: string, expiresSec = 3600): Promise<string | null> {
+  if (!supabase) return null;
+  const bucket = getSupabaseStorageConfigFromEnv()?.bucket || "sigma-pdfs";
+  const path = String(objectPath || "").trim();
+  if (!path) return null;
+  const { data, error } = await supabase.storage.from(bucket).createSignedUrl(path, expiresSec);
+  if (error || !data?.signedUrl) {
+    // eslint-disable-next-line no-console
+    console.warn("[supabaseStorage] createSignedUrl failed", { bucket, path, message: error?.message });
+    return null;
+  }
+  return data.signedUrl;
 }
 
 function asUint8(buf: Buffer): Uint8Array {
