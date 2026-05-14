@@ -8,7 +8,8 @@ function isHttpProtocol(p: string): boolean {
 
 function defaultTimeoutMsForPath(pathname: string): number {
   // Rotas que podem demorar (SMTP / cold start do Render).
-  if (pathname.includes("/api/shift-reports/send")) return 180_000;
+  // Render free: cold start + PDF + SMTP/Resend pode ir além de 3 min.
+  if (pathname.includes("/api/shift-reports/send")) return 300_000;
   if (pathname.includes("/api/shift-reports/upload")) return 180_000;
   return 60_000;
 }
@@ -103,7 +104,9 @@ function sleepMs(ms: number): Promise<void> {
 
 function isNetworkError(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : typeof e === "string" ? e : "";
-  return /failed to fetch|networkerror|load failed|fetch failed/i.test(String(msg));
+  return /failed to fetch|networkerror|load failed|fetch failed|timed out|timeout|connection timeout|abort|econnreset|network request failed/i.test(
+    String(msg),
+  );
 }
 
 export type ApiRetryOptions = {

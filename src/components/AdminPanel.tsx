@@ -1421,10 +1421,18 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                                               absolute,
                                               origin: window.location.origin,
                                             });
-                                            const resp = await apiFetchExternal(urlPath, {
-                                              method: 'POST',
-                                              headers: { Authorization: `Bearer ${token}` },
-                                            }, { retries: 2, baseDelayMs: 800, maxDelayMs: 5000 });
+                                            const resp = await apiFetchExternal(
+                                              urlPath,
+                                              {
+                                                method: 'POST',
+                                                headers: { Authorization: `Bearer ${token}` },
+                                              },
+                                              {
+                                                retries: 4,
+                                                baseDelayMs: 2500,
+                                                maxDelayMs: 15000,
+                                              },
+                                            );
                                             const payload = await resp
                                               .json()
                                               .catch(() => ({} as any));

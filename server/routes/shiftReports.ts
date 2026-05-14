@@ -10,6 +10,7 @@ import {
   supabaseShiftReportsBucket,
   uploadShiftReportPdfToSupabase,
 } from "../lib/supabaseShiftReports";
+import { isResendConfigured, sendEmailWithPdfViaResend } from "../lib/resendShiftReportMail";
 
 function getMailTransportIfConfigured() {
   const host = process.env.SMTP_HOST;
@@ -24,9 +25,10 @@ function getMailTransportIfConfigured() {
     port,
     secure: port === 465,
     auth: { user, pass },
-    connectionTimeout: 20_000,
-    greetingTimeout: 20_000,
-    socketTimeout: 60_000,
+    /** Render / redes lentas: 20s costumava gerar "Connection timeout" ao anexar PDF + cold start. */
+    connectionTimeout: 60_000,
+    greetingTimeout: 45_000,
+    socketTimeout: 120_000,
   });
 }
 
@@ -35,7 +37,7 @@ function requireConfiguredEmailOrRespond(res: express.Response): string | null {
   if (!adminEmail) {
     res.status(501).json({
       error:
-        "ADMIN_EMAIL não configurado no servidor. Configure ADMIN_EMAIL (e SMTP_*) para envio automático.",
+        "ADMIN_EMAIL não configurado no servidor. Configure ADMIN_EMAIL e Resend (RESEND_API_KEY + RESEND_FROM) ou SMTP_*.",
     });
     return null;
   }
@@ -198,11 +200,35 @@ async function downloadShiftReportPdfBuffer(opts: { reportId: string; data: any 
 }
 
 async function readPdfBufferForEmail(opts: { reportId: string; data: any }): Promise<Buffer> {
+  const { reportId, data } = opts;
+  const delivery = String(data?.delivery || "").trim();
+
+  if (delivery === "supabase" && !isSupabaseShiftReportsConfigured()) {
+    throw new Error(
+      "Este relatório usa Supabase (campo delivery=supabase), mas o servidor Node não está configurado: faltam SUPABASE_URL e/ou SUPABASE_SERVICE_ROLE_KEY no Render (ou no .env local). " +
+        "Adiciona as variáveis ao serviço que corre a API, guarda e faz redeploy. Sem isto, o servidor não consegue ler o PDF do bucket.",
+    );
+  }
+
   const buf = await downloadShiftReportPdfBuffer(opts);
   if (buf?.length) return buf;
+
+  if (delivery === "supabase") {
+    const sp = String(data?.storagePath || "").trim();
+    const bucket = supabaseShiftReportsBucket();
+    throw new Error(
+      "O PDF não foi encontrado no Supabase (ou o download falhou). Confirma no Supabase: bucket \"" +
+        bucket +
+        "\", objeto em \"" +
+        (sp || "(storagePath vazio no Firestore)") +
+        "\", políticas de Storage e se o ficheiro existe. Se o upload falhou noutra altura, regera o relatório no app.",
+    );
+  }
+
   throw new Error(
-    "Não foi possível obter o PDF. Confirme no servidor: SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY + bucket sigma-pdfs (ou SUPABASE_STORAGE_BUCKET), " +
-      "ou para relatórios antigos: FIREBASE_SERVICE_ACCOUNT e Firebase Storage (Blaze). Gere novamente o relatório no app se o ficheiro não existir.",
+    "Não foi possível obter o PDF. Para relatórios em Firebase Storage: FIREBASE_SERVICE_ACCOUNT válido e Firebase Storage (Blaze) com o ficheiro no caminho do documento. " +
+      "Para relatórios novos em Supabase: SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY e bucket sigma-pdfs. " +
+      "Regenera o relatório no app se o ficheiro tiver sido apagado.",
   );
 }
 
@@ -552,11 +578,12 @@ export function registerShiftReportRoutes(app: express.Express) {
         return res.status(403).json({ error: "Somente o ADM MASTER pode enviar por e-mail." });
       }
 
-      const transport = getMailTransportIfConfigured();
-      if (!transport) {
+      const transport = isResendConfigured() ? null : getMailTransportIfConfigured();
+      if (!isResendConfigured() && !transport) {
         return res.status(501).json({
           error:
-            "SMTP não configurado. Configure SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS (e SMTP_FROM) no servidor.",
+            "E-mail não configurado. Opção A (recomendada no Render): RESEND_API_KEY + RESEND_FROM (domínio verificado no Resend) + ADMIN_EMAIL. " +
+            "Opção B: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM e ADMIN_EMAIL.",
         });
       }
 
@@ -570,7 +597,16 @@ export function registerShiftReportRoutes(app: express.Express) {
 
       // eslint-disable-next-line no-console
       console.log("[shift-reports] send: obtendo PDF para anexo", { reportId });
-      const buffer = await readPdfBufferForEmail({ reportId, data });
+      let buffer: Buffer;
+      try {
+        buffer = await readPdfBufferForEmail({ reportId, data });
+      } catch (pdfErr) {
+        console.error("[shift-reports] send: falha ao obter PDF", pdfErr);
+        const msg = pdfErr instanceof Error ? pdfErr.message : String(pdfErr);
+        return res.status(500).json({
+          error: `Não foi possível obter o PDF para anexar: ${msg}`,
+        });
+      }
       // eslint-disable-next-line no-console
       console.log("[shift_report_supabase] email attach", {
         reportId,
@@ -580,7 +616,12 @@ export function registerShiftReportRoutes(app: express.Express) {
         uploaded: data?.uploaded,
       });
       // eslint-disable-next-line no-console
-      console.log("[shift-reports] send: PDF pronto, enviando SMTP", { reportId, bytes: buffer.length, to: adminEmail });
+      console.log("[shift-reports] send: PDF pronto", {
+        reportId,
+        bytes: buffer.length,
+        to: adminEmail,
+        provider: isResendConfigured() ? "resend" : "smtp",
+      });
 
       const subject = `SIGMA-GCM - Relatório de Plantão (${data?.agentName || "-"})`;
       const text = [
@@ -596,19 +637,43 @@ export function registerShiftReportRoutes(app: express.Express) {
         "Envio acionado manualmente pelo ADM MASTER (SIGMA-GCM).",
       ].join("\n");
 
-      await transport.sendMail({
-        from: process.env.SMTP_FROM || process.env.SMTP_USER,
-        to: adminEmail,
-        subject,
-        text,
-        attachments: [
-          {
-            filename: String(data?.filename || "relatorio.pdf"),
-            content: buffer,
-            contentType: "application/pdf",
-          },
-        ],
-      });
+      const pdfFilename = String(data?.filename || "relatorio.pdf");
+
+      try {
+        if (isResendConfigured()) {
+          await sendEmailWithPdfViaResend({
+            to: adminEmail,
+            subject,
+            text,
+            pdfFilename,
+            pdfBuffer: buffer,
+            reportId,
+          });
+        } else if (transport) {
+          await transport.sendMail({
+            from: process.env.SMTP_FROM || process.env.SMTP_USER,
+            to: adminEmail,
+            subject,
+            text,
+            attachments: [
+              {
+                filename: pdfFilename,
+                content: buffer,
+                contentType: "application/pdf",
+              },
+            ],
+          });
+        }
+      } catch (mailErr) {
+        console.error("[shift-reports] send: falha envio e-mail", mailErr);
+        const mailMsg = mailErr instanceof Error ? mailErr.message : String(mailErr);
+        const hint = isResendConfigured()
+          ? "Confirme RESEND_API_KEY, RESEND_FROM (domínio verificado em Resend → Domains) e o destino ADMIN_EMAIL. Veja Logs no Resend."
+          : "Confirme no Render: SMTP_HOST, SMTP_PORT (587 TLS ou 465 SSL), SMTP_USER, SMTP_PASS, SMTP_FROM.";
+        return res.status(500).json({
+          error: `Falha ao enviar e-mail (${isResendConfigured() ? "Resend" : "SMTP"}). ${hint} Detalhe: ${mailMsg}`,
+        });
+      }
 
       await snap.ref.set(
         {
