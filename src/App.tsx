@@ -96,7 +96,7 @@ import { auth, db, storage } from './firebase';
 import { getSecondaryAuth } from './lib/firebaseSecondary';
 import { cn } from './lib/utils';
 import { resolveOperationalTeam, fallbackTeamForPatrol } from './lib/resolveOperationalTeam';
-import { apiFetchShiftReport, getApiBaseUrl } from './lib/apiClient';
+import { apiFetchShiftReport, getApiBaseUrl, shiftReportsApiShouldUseExternal } from './lib/apiClient';
 import {
   registerShiftReportMetadataFirestore,
   uploadShiftReportPdfToFirebase,
@@ -1388,10 +1388,11 @@ function App() {
       };
 
       try {
-        const apiBase = getApiBaseUrl();
+        // APK: getApiBaseUrl() é null, mas o upload do PDF tem de ir para a API (Render + Supabase).
+        const canUploadViaServerApi = !!getApiBaseUrl() || shiftReportsApiShouldUseExternal();
         let usedFirebase = false;
         let metadataOnly = false;
-        if (apiBase) {
+        if (canUploadViaServerApi) {
           try {
             await sendToServerAndRegister();
           } catch (apiErr) {
@@ -1455,10 +1456,10 @@ function App() {
         }
         alert(
           metadataOnly
-            ? 'Plantão registrado no Painel (somente dados — sem PDF no Firebase).\n\nBaixar/Imprimir só funcionará com Storage (Blaze) ou API configurada (VITE_API_BASE_URL).'
+            ? 'Plantão registado no painel (só dados — sem PDF).\n\nNo APK: defina VITE_API_BASE_URL para o Render. Na web: confirme Supabase no servidor e tente de novo.'
             : usedFirebase
               ? 'Relatório guardado no Firebase Storage e registado no painel (Relatórios).'
-              : 'Relatório gerado e enviado ao painel (PDF no servidor).',
+              : 'Relatório gerado e enviado ao painel (PDF no Supabase/servidor).',
         );
       } catch (sendErr) {
         console.error('Falha ao enviar relatório para o Painel do ADM:', sendErr);
@@ -1470,7 +1471,7 @@ function App() {
               : JSON.stringify(sendErr);
         alert(
           'Relatório PDF foi gerado, mas falhou ao registrar no sistema.\n\n' +
-            'No APK: verifique internet e permissões do Storage/Firestore.\n\n' +
+            'Verifique internet, VITE_API_BASE_URL (APK), Supabase no Render e token de sessão.\n\n' +
             `Detalhes: ${msg}`,
         );
         throw sendErr;
