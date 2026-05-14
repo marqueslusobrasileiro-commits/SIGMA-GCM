@@ -26,6 +26,14 @@ function isLikelySupabasePublicUrl(url: string): boolean {
   return /\.supabase\.co\//i.test(url) || /\/storage\/v1\/object\/public\//i.test(url);
 }
 
+/** Relatórios no Supabase devem baixar pela API (URL assinada no servidor), não por URL pública/legada. */
+function shouldPreferApiForShiftReportPdf(r: ShiftReport): boolean {
+  if (r.delivery === "supabase") return true;
+  const du = r.downloadUrl?.trim() || "";
+  if (du.startsWith("/api/shift-reports/file/")) return true;
+  return false;
+}
+
 async function pdfBlobToBase64(blob: Blob): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -351,6 +359,14 @@ export async function resolveShiftReportPdfBlob(r: ShiftReport): Promise<Blob> {
     }
   }
 
+  if (shouldPreferApiForShiftReportPdf(r) && (shiftReportsApiShouldUseExternal() || getApiBaseUrl())) {
+    try {
+      return await fetchShiftReportPdfFromApiBlob(r);
+    } catch (e) {
+      console.warn("[shift_report] API (PDF assinado) falhou, tentando URL pública/legado", e);
+    }
+  }
+
   const publicUrl = r.publicUrl?.trim();
   if (publicUrl && /^https?:\/\//i.test(publicUrl) && isLikelySupabasePublicUrl(publicUrl)) {
     const resp = await withTimeout(fetch(publicUrl), 22_000, "Baixar PDF (Supabase URL pública)");
@@ -362,16 +378,16 @@ export async function resolveShiftReportPdfBlob(r: ShiftReport): Promise<Blob> {
 
   const url = r.downloadUrl?.trim();
   if (url && /^https?:\/\//i.test(url)) {
-    const resp = await withTimeout(fetch(url), 22_000, "Baixar PDF (URL)");
-    if (!resp.ok) {
-      throw new Error(`Falha ao baixar PDF pela URL (${resp.status}).`);
+    if (r.delivery === "supabase" && (isLikelySupabasePublicUrl(url) || /\.supabase\.co\/storage\//i.test(url))) {
+      // Bucket privado: URL pública/Storage HTTPS costuma retornar 400; a API já foi tentada acima.
+    } else {
+      const resp = await withTimeout(fetch(url), 22_000, "Baixar PDF (URL)");
+      if (!resp.ok) {
+        throw new Error(`Falha ao baixar PDF pela URL (${resp.status}).`);
+      }
+      const blob = await resp.blob();
+      return ensurePdfBlob(blob);
     }
-    const blob = await resp.blob();
-    return ensurePdfBlob(blob);
-  }
-
-  if (r.delivery === "supabase" && (shiftReportsApiShouldUseExternal() || getApiBaseUrl())) {
-    return await fetchShiftReportPdfFromApiBlob(r);
   }
 
   const path = r.storagePath?.trim();
