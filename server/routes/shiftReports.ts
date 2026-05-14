@@ -3,11 +3,11 @@ import nodemailer from "nodemailer";
 import { FieldValue } from "firebase-admin/firestore";
 import { db } from "../lib/firebaseAdmin";
 import { requireFirebaseAuth } from "../lib/httpAuth";
-import { createSignedPdfUrl, supabase } from "../lib/supabaseStorage";
 import {
-  downloadShiftReportPdfFromSupabase,
+  fetchPdfBufferFromSignedUrl,
   isSupabaseShiftReportsConfigured,
   removeShiftReportPdfFromSupabase,
+  shiftReportSignedPdfReadUrl,
   supabaseShiftReportsBucket,
   uploadShiftReportPdfToSupabase,
 } from "../lib/supabaseShiftReports";
@@ -106,15 +106,26 @@ function collectSupabaseObjectPaths(reportId: string, data: any): string[] {
 }
 
 /**
- * Obtém o PDF no servidor (e-mail, etc.) via Supabase SDK + service role.
+ * Obtém o PDF: storagePath (e fallbacks) → createSignedUrl(60s) → fetch da URL assinada → Buffer.
  */
 async function downloadShiftReportPdfBuffer(opts: { reportId: string; data: any }): Promise<Buffer | null> {
   const { reportId, data } = opts;
   if (!isSupabaseShiftReportsConfigured()) return null;
 
   for (const objectPath of collectSupabaseObjectPaths(reportId, data)) {
-    const buf = await downloadShiftReportPdfFromSupabase(objectPath, reportId);
-    if (buf?.length) return buf;
+    const signed = await shiftReportSignedPdfReadUrl(objectPath, 60);
+    if (!signed) continue;
+    // eslint-disable-next-line no-console
+    console.log("[shift-reports] signed URL generated", {
+      reportId,
+      bucket: supabaseShiftReportsBucket(),
+      pathPrefix: objectPath.slice(0, 72),
+    });
+    const buf = await fetchPdfBufferFromSignedUrl(signed);
+    if (!buf?.length) continue;
+    // eslint-disable-next-line no-console
+    console.log("[shift-reports] PDF downloaded via signed URL", { reportId, bytes: buf.length });
+    return buf;
   }
   return null;
 }
@@ -148,7 +159,6 @@ export function registerShiftReportRoutes(app: express.Express) {
     console.log("[shift-reports] upload request received", {
       hasAuth: !!req.headers.authorization,
       contentLength: req.headers["content-length"],
-      supabase: !!supabase,
       bucket: supabaseShiftReportsBucket(),
     });
     const decoded = await requireFirebaseAuth(req, res);
@@ -193,7 +203,6 @@ export function registerShiftReportRoutes(app: express.Express) {
     const agentId = String(meta?.agentId || decoded.uid).trim();
     const windowStartIso = String(meta?.windowStart || new Date().toISOString());
     const storagePath = buildRelatorioStoragePath(agentId, finalReportId, windowStartIso);
-    const apiFileUrl = `/api/shift-reports/file/${encodeURIComponent(finalReportId)}`;
 
     const up = await uploadShiftReportPdfToSupabase({
       buffer,
@@ -220,8 +229,8 @@ export function registerShiftReportRoutes(app: express.Express) {
         createdAt: new Date().toISOString(),
         generatedAt: new Date().toISOString(),
         filename: safeName,
-        downloadUrl: apiFileUrl,
-        publicUrl: null,
+        downloadUrl: FieldValue.delete(),
+        publicUrl: FieldValue.delete(),
         storagePath: up.storagePath,
         uploaded: true,
         uploadedAt: new Date().toISOString(),
@@ -251,17 +260,14 @@ export function registerShiftReportRoutes(app: express.Express) {
     res.json({
       ok: true,
       reportId: finalReportId,
-      downloadUrl: apiFileUrl,
       storagePath: up.storagePath,
-      publicUrl: null,
       uploaded: true,
       delivery: "supabase",
     });
   });
 
   /**
-   * Download: redireciona para URL assinada do Supabase (bucket privado).
-   * Query opcional: ?stream=1 — devolve o PDF no corpo (útil se o redirect falhar por CORS em algum cliente).
+   * Download: storagePath → createSignedUrl(60) → fetch no servidor → PDF no corpo (sem redirect, sem URL pública).
    */
   app.get("/api/shift-reports/file/:reportId", async (req, res) => {
     const decoded = await requireFirebaseAuth(req, res);
@@ -284,30 +290,16 @@ export function registerShiftReportRoutes(app: express.Express) {
       return res.status(403).json({ error: "forbidden" });
     }
 
-    if (!isSupabaseShiftReportsConfigured() || !supabase) {
+    if (!isSupabaseShiftReportsConfigured()) {
       return res.status(503).json({ error: "Supabase não configurado no servidor." });
     }
-
-    const wantStream = String(req.query.stream || "") === "1";
 
     // eslint-disable-next-line no-console
     console.log("[shift-reports] file GET", {
       reportId,
       delivery: data?.delivery,
       bucket: supabaseShiftReportsBucket(),
-      redirectSigned: !wantStream,
     });
-
-    if (!wantStream) {
-      for (const objectPath of collectSupabaseObjectPaths(reportId, data)) {
-        const signed = await createSignedPdfUrl(objectPath, 3600);
-        if (signed) {
-          // eslint-disable-next-line no-console
-          console.log("[shift-reports] file GET redirect signed URL", { reportId, pathPrefix: objectPath.slice(0, 48) });
-          return res.redirect(302, signed);
-        }
-      }
-    }
 
     const buf = await downloadShiftReportPdfBuffer({ reportId, data });
     if (!buf?.length) {
@@ -317,8 +309,6 @@ export function registerShiftReportRoutes(app: express.Express) {
       });
     }
 
-    // eslint-disable-next-line no-console
-    console.log("[shift-reports] file GET: stream PDF", { reportId, bytes: buf.length });
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `inline; filename="${String(data?.filename || "relatorio.pdf")}"`);
     res.send(buf);

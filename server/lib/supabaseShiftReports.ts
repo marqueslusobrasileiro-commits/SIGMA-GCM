@@ -26,7 +26,7 @@ export async function uploadShiftReportPdfToSupabase(opts: {
   buffer: Buffer;
   objectPath: string;
   reportId?: string;
-}): Promise<{ publicUrl: string; storagePath: string } | null> {
+}): Promise<{ storagePath: string } | null> {
   const sup = getClient();
   if (!sup) return null;
   const bucket = supabaseShiftReportsBucket();
@@ -50,49 +50,71 @@ export async function uploadShiftReportPdfToSupabase(opts: {
     return null;
   }
 
-  const { data: pub } = sup.storage.from(bucket).getPublicUrl(objectPath);
-  const publicUrl = String(pub?.publicUrl || "").trim();
   // eslint-disable-next-line no-console
   console.info("[shift_report_supabase] upload ok", {
     bucket,
     path: objectPath,
     reportId: reportId || "(n/d)",
-    hasPublicUrl: !!publicUrl,
   });
 
-  return { publicUrl, storagePath: objectPath };
+  return { storagePath: objectPath };
 }
 
-export async function downloadShiftReportPdfFromSupabase(
+/**
+ * URL de leitura temporária (bucket privado). Sem URLs públicas /object/public.
+ */
+export async function shiftReportSignedPdfReadUrl(
   objectPath: string,
-  reportId?: string,
-): Promise<Buffer | null> {
+  expiresSec = 60,
+): Promise<string | null> {
   const sup = getClient();
   if (!sup) return null;
   const bucket = supabaseShiftReportsBucket();
-  // eslint-disable-next-line no-console
-  console.info("[shift_report_supabase] download", { bucket, path: objectPath, reportId: reportId || "(n/d)" });
+  const path = String(objectPath || "").trim();
+  if (!path) return null;
 
-  const { data, error } = await sup.storage.from(bucket).download(objectPath);
-  if (error || !data) {
+  const { data, error } = await sup.storage.from(bucket).createSignedUrl(path, expiresSec);
+  if (error || !data?.signedUrl) {
     // eslint-disable-next-line no-console
-    console.warn("[shift_report_supabase] download failed", {
+    console.warn("[shift_report_supabase] createSignedUrl failed", {
       bucket,
-      path: objectPath,
-      message: error?.message || "sem dados",
+      path,
+      message: error?.message,
     });
     return null;
   }
+  return data.signedUrl;
+}
 
-  const buf = Buffer.from(await data.arrayBuffer());
-  // eslint-disable-next-line no-console
-  console.info("[shift_report_supabase] download ok", {
-    bucket,
-    path: objectPath,
-    bytes: buf.length,
-    reportId: reportId || "(n/d)",
-  });
-  return buf;
+export async function fetchPdfBufferFromSignedUrl(signedUrl: string): Promise<Buffer | null> {
+  const url = String(signedUrl || "").trim();
+  if (!url) return null;
+
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), 45_000);
+  try {
+    const resp = await fetch(url, { method: "GET", signal: ac.signal });
+    if (!resp.ok) {
+      const txt = await resp.text().catch(() => "");
+      // eslint-disable-next-line no-console
+      console.warn("[shift_report_supabase] fetch signed URL failed", {
+        status: resp.status,
+        detail: txt.slice(0, 200),
+      });
+      return null;
+    }
+    const ab = await resp.arrayBuffer();
+    const buf = Buffer.from(ab);
+    return buf.length ? buf : null;
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn("[shift_report_supabase] fetch signed URL error", {
+      message: e instanceof Error ? e.message : String(e),
+    });
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
 }
 
 export async function removeShiftReportPdfFromSupabase(objectPath: string, reportId?: string): Promise<void> {

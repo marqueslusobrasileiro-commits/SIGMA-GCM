@@ -6,12 +6,17 @@ import {
   updateDoc,
   deleteField,
 } from "firebase/firestore";
-import { getBlob, getDownloadURL, ref, uploadBytes, deleteObject } from "firebase/storage";
+import { getBlob, ref, uploadBytes, deleteObject } from "firebase/storage";
 import { auth, db, storage } from "../firebase";
 import type { ShiftReport, Team, UserProfile } from "../types";
 import { apiFetch, apiFetchExternal, apiFetchShiftReport, getApiBaseUrl, getExternalApiBaseUrl, shiftReportsApiShouldUseExternal } from "./apiClient";
 import { Capacitor } from "@capacitor/core";
 import { setDocClean, updateDocClean } from "./firestoreData";
+
+/** Rota autenticada no backend (Render): PDF via storagePath → signed URL → buffer. */
+export function shiftReportPdfDownloadApiPath(reportId: string): string {
+  return `/api/shift-reports/file/${encodeURIComponent(reportId)}`;
+}
 
 /** Igual ao servidor: `relatorios/AAAA/MM/uid/reportId.pdf` */
 function buildRelatorioStoragePath(uid: string, reportId: string, windowStartIso: string): string {
@@ -22,15 +27,21 @@ function buildRelatorioStoragePath(uid: string, reportId: string, windowStartIso
   return `relatorios/${yyyy}/${mm}/${uid}/${reportId}.pdf`;
 }
 
-function isLikelySupabasePublicUrl(url: string): boolean {
-  return /\.supabase\.co\//i.test(url) || /\/storage\/v1\/object\/public\//i.test(url);
+/**
+ * PDF armazenado no Supabase (metadados). Não usar fetch em URLs do Storage no cliente.
+ */
+export function isSupabaseBackedShiftReport(r: ShiftReport): boolean {
+  if (r.delivery === "supabase") return true;
+  if (String(r.supabaseStorageBucket || "").trim()) return true;
+  const sp = r.storagePath?.trim() || "";
+  if (sp.startsWith("relatorios/")) return true;
+  return false;
 }
 
-/** Relatórios no Supabase devem baixar pela API (URL assinada no servidor), não por URL pública/legada. */
+/** Baixar só pela rota `/api/shift-reports/file/:id` (backend assina e busca o PDF). */
 function shouldPreferApiForShiftReportPdf(r: ShiftReport): boolean {
-  if (r.delivery === "supabase") return true;
-  const du = r.downloadUrl?.trim() || "";
-  if (du.startsWith("/api/shift-reports/file/")) return true;
+  if (isSupabaseBackedShiftReport(r)) return true;
+  if (r.uploaded && r.delivery !== "firebase_storage" && r.delivery !== "metadata_only") return true;
   return false;
 }
 
@@ -81,8 +92,9 @@ function assertReportOwner(existing: unknown, profile: UserProfile, reportId: st
 
 /** Caminho no Firebase Storage (doc explícito, layout novo ou legado). Não usar `storagePath` do Supabase no cliente Firebase. */
 export function inferShiftReportStoragePath(r: ShiftReport): string | null {
+  if (isSupabaseBackedShiftReport(r)) return null;
   const explicit = r.storagePath?.trim();
-  if (explicit && r.delivery !== "supabase") return explicit;
+  if (explicit) return explicit;
   const uid = r.agentId?.trim();
   const id = r.id?.trim();
   const ws = r.windowStart?.trim();
@@ -91,12 +103,11 @@ export function inferShiftReportStoragePath(r: ShiftReport): string | null {
   return null;
 }
 
-/** Há como obter o blob do PDF (URL, Storage explícito, caminho inferido ou API). */
+/** Há como obter o blob do PDF (Storage Firebase, caminho inferido ou rota API com storagePath no servidor). */
 export function shiftReportHasResolvablePdfSource(r: ShiftReport): boolean {
   if (r.delivery === "metadata_only") return false;
-  if (r.publicUrl?.trim()) return true;
-  if (r.downloadUrl?.trim()) return true;
   if (r.storagePath?.trim()) return true;
+  if (r.uploaded) return true;
   if (inferShiftReportStoragePath(r)) return true;
   return !!getApiBaseUrl() || Capacitor.isNativePlatform();
 }
@@ -245,8 +256,6 @@ export async function uploadShiftReportPdfToFirebase(opts: {
     38_000,
     "Firebase Storage (upload PDF)",
   );
-  const downloadUrl = await withTimeout(getDownloadURL(sRef), 22_000, "Firebase Storage (URL)");
-
   // Se o doc já existir (retentativa), fazemos merge com delivery=storage.
   const existing = await getDoc(doc(db, "shift_reports", reportId));
   if (existing.exists()) {
@@ -259,7 +268,8 @@ export async function uploadShiftReportPdfToFirebase(opts: {
       {
         createdAt: new Date().toISOString(),
         filename,
-        downloadUrl,
+        downloadUrl: deleteField(),
+        publicUrl: deleteField(),
         storagePath,
         agentId: profile.uid,
         agentName: profile.name,
@@ -295,7 +305,7 @@ async function fetchShiftReportPdfFromApiBlob(r: ShiftReport): Promise<Blob> {
   const u = auth.currentUser;
   if (!u) throw new Error("Sessão expirada.");
   const token = await u.getIdToken();
-  const resp = await apiFetchShiftReport(`/api/shift-reports/file/${encodeURIComponent(r.id)}`, {
+  const resp = await apiFetchShiftReport(shiftReportPdfDownloadApiPath(r.id), {
     method: "GET",
     headers: { Authorization: `Bearer ${token}` },
   });
@@ -322,7 +332,7 @@ async function fetchShiftReportPdfFromApiBlob(r: ShiftReport): Promise<Blob> {
   return ensurePdfBlob(blob);
 }
 
-/** Baixa o PDF do relatório: URL pública/tokenizada → Storage → API (se configurada). */
+/** Baixa o PDF: rota API (Supabase assinado no servidor) ou Firebase Storage legado. */
 export async function resolveShiftReportPdfBlob(r: ShiftReport): Promise<Blob> {
   // No APK/WebView, preferimos a API externa (Render) para evitar problemas de CORS/redirect do Storage.
   // Isso também elimina o risco de cair em `localhost` quando o app roda como WebView.
@@ -331,7 +341,7 @@ export async function resolveShiftReportPdfBlob(r: ShiftReport): Promise<Blob> {
       const u = auth.currentUser;
       if (!u) throw new Error("Sessão expirada.");
       const token = await u.getIdToken();
-      const path = `/api/shift-reports/file/${encodeURIComponent(r.id)}`;
+      const path = shiftReportPdfDownloadApiPath(r.id);
       const absolute = `${getExternalApiBaseUrl()}${path}`;
       console.info("[shift_report] baixar PDF via API externa", { absolute });
       const resp = await apiFetchExternal(
@@ -363,42 +373,19 @@ export async function resolveShiftReportPdfBlob(r: ShiftReport): Promise<Blob> {
     try {
       return await fetchShiftReportPdfFromApiBlob(r);
     } catch (e) {
-      console.warn("[shift_report] API (PDF assinado) falhou, tentando URL pública/legado", e);
-    }
-  }
-
-  const publicUrl = r.publicUrl?.trim();
-  if (publicUrl && /^https?:\/\//i.test(publicUrl) && isLikelySupabasePublicUrl(publicUrl)) {
-    const resp = await withTimeout(fetch(publicUrl), 22_000, "Baixar PDF (Supabase URL pública)");
-    if (resp.ok) {
-      const blob = await resp.blob();
-      return ensurePdfBlob(blob);
-    }
-  }
-
-  const url = r.downloadUrl?.trim();
-  if (url && /^https?:\/\//i.test(url)) {
-    if (r.delivery === "supabase" && (isLikelySupabasePublicUrl(url) || /\.supabase\.co\/storage\//i.test(url))) {
-      // Bucket privado: URL pública/Storage HTTPS costuma retornar 400; a API já foi tentada acima.
-    } else {
-      const resp = await withTimeout(fetch(url), 22_000, "Baixar PDF (URL)");
-      if (!resp.ok) {
-        throw new Error(`Falha ao baixar PDF pela URL (${resp.status}).`);
-      }
-      const blob = await resp.blob();
-      return ensurePdfBlob(blob);
+      console.warn("[shift_report] API (PDF via servidor) falhou, tentando Firebase Storage legado", e);
     }
   }
 
   const path = r.storagePath?.trim();
-  if (path && r.delivery !== "supabase") {
+  if (path && !isSupabaseBackedShiftReport(r)) {
     const sRef = ref(storage, path);
     const blob = await withTimeout(getBlob(sRef), 14_000, "Storage (PDF)");
     return ensurePdfBlob(blob);
   }
 
   const inferred = inferShiftReportStoragePath(r);
-  if (inferred && r.delivery !== "supabase") {
+  if (inferred) {
     try {
       const sRef = ref(storage, inferred);
       const blob = await withTimeout(getBlob(sRef), 14_000, "Storage (PDF inferido)");
@@ -412,7 +399,7 @@ export async function resolveShiftReportPdfBlob(r: ShiftReport): Promise<Blob> {
     throw new Error(
       r.delivery === "metadata_only"
         ? "Este plantão foi registrado só com dados (sem PDF). Configure Supabase/API no servidor ou Firebase Storage (Blaze)."
-        : "Não foi possível localizar o PDF (URL, Storage nem API). Gere de novo no app ou defina VITE_API_BASE_URL / VITE_EXTERNAL_API_BASE_URL.",
+        : "Não foi possível localizar o PDF (Storage Firebase, rota API ou configuração). Gere de novo no app ou defina VITE_API_BASE_URL / VITE_EXTERNAL_API_BASE_URL.",
     );
   }
 
