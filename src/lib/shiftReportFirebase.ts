@@ -9,7 +9,7 @@ import {
 import { getBlob, ref, uploadBytes, deleteObject } from "firebase/storage";
 import { auth, db, storage } from "../firebase";
 import type { ShiftReport, Team, UserProfile } from "../types";
-import { apiFetch, apiFetchExternal, apiFetchShiftReport, getApiBaseUrl, getExternalApiBaseUrl, shiftReportsApiShouldUseExternal } from "./apiClient";
+import { apiFetch, apiFetchExternal, apiFetchShiftReport, getApiBaseUrl, shiftReportsApiShouldUseExternal } from "./apiClient";
 import { Capacitor } from "@capacitor/core";
 import { setDocClean, updateDocClean } from "./firestoreData";
 
@@ -38,11 +38,8 @@ export function isSupabaseBackedShiftReport(r: ShiftReport): boolean {
   return false;
 }
 
-/** Baixar só pela rota `/api/shift-reports/file/:id` (backend assina e busca o PDF). */
-function shouldPreferApiForShiftReportPdf(r: ShiftReport): boolean {
-  if (isSupabaseBackedShiftReport(r)) return true;
-  if (r.uploaded && r.delivery !== "firebase_storage" && r.delivery !== "metadata_only") return true;
-  return false;
+function canDownloadShiftReportViaApi(): boolean {
+  return shiftReportsApiShouldUseExternal() || !!getApiBaseUrl();
 }
 
 async function pdfBlobToBase64(blob: Blob): Promise<string> {
@@ -103,7 +100,7 @@ export function inferShiftReportStoragePath(r: ShiftReport): string | null {
   return null;
 }
 
-/** Há como obter o blob do PDF (Storage Firebase, caminho inferido ou rota API com storagePath no servidor). */
+/** Há como obter o PDF: rota API (Supabase no servidor) ou, em legado, Firebase Storage no cliente. */
 export function shiftReportHasResolvablePdfSource(r: ShiftReport): boolean {
   if (r.delivery === "metadata_only") return false;
   if (r.storagePath?.trim()) return true;
@@ -332,48 +329,24 @@ async function fetchShiftReportPdfFromApiBlob(r: ShiftReport): Promise<Blob> {
   return ensurePdfBlob(blob);
 }
 
-/** Baixa o PDF: rota API (Supabase assinado no servidor) ou Firebase Storage legado. */
+/** Baixa o PDF: primeiro a rota API (Render + Supabase Storage assinado); depois só legado Firebase Storage no cliente, se existir. */
 export async function resolveShiftReportPdfBlob(r: ShiftReport): Promise<Blob> {
-  // No APK/WebView, preferimos a API externa (Render) para evitar problemas de CORS/redirect do Storage.
-  // Isso também elimina o risco de cair em `localhost` quando o app roda como WebView.
-  if (Capacitor.isNativePlatform()) {
-    try {
-      const u = auth.currentUser;
-      if (!u) throw new Error("Sessão expirada.");
-      const token = await u.getIdToken();
-      const path = shiftReportPdfDownloadApiPath(r.id);
-      const absolute = `${getExternalApiBaseUrl()}${path}`;
-      console.info("[shift_report] baixar PDF via API externa", { absolute });
-      const resp = await apiFetchExternal(
-        path,
-        {
-          method: "GET",
-          headers: { Authorization: `Bearer ${token}` },
-        },
-        { retries: 2, baseDelayMs: 900, maxDelayMs: 6000 },
-      );
-      if (!resp.ok) {
-        const text = await resp.text().catch(() => "");
-        throw new Error(text || `Falha ao baixar PDF (HTTP ${resp.status})`);
-      }
-      const contentType = (resp.headers.get("content-type") || "").toLowerCase();
-      const blob = await resp.blob();
-      if (!contentType.includes("application/pdf")) {
-        const txt = await blob.text().catch(() => "");
-        throw new Error((txt && txt.slice(0, 300)) || `Resposta inválida do servidor (Content-Type: ${contentType || "?"})`);
-      }
-      return ensurePdfBlob(blob);
-    } catch (e) {
-      console.warn("[shift_report] fallback: API externa falhou, tentando Storage/URL", e);
-      // continua para as estratégias abaixo
-    }
+  if (r.delivery === "metadata_only") {
+    throw new Error(
+      "Este plantão foi registrado só com dados (sem PDF). Configure o servidor com Supabase ou gere de novo com upload de PDF.",
+    );
   }
 
-  if (shouldPreferApiForShiftReportPdf(r) && (shiftReportsApiShouldUseExternal() || getApiBaseUrl())) {
+  const canApi = canDownloadShiftReportViaApi();
+
+  if (canApi && r.id) {
     try {
       return await fetchShiftReportPdfFromApiBlob(r);
     } catch (e) {
-      console.warn("[shift_report] API (PDF via servidor) falhou, tentando Firebase Storage legado", e);
+      console.warn(
+        "[shift_report] download via API falhou (Render/Supabase ou rede); tentando Firebase Storage legado no cliente",
+        e,
+      );
     }
   }
 
@@ -395,15 +368,15 @@ export async function resolveShiftReportPdfBlob(r: ShiftReport): Promise<Blob> {
     }
   }
 
-  if (!getApiBaseUrl() && !shiftReportsApiShouldUseExternal()) {
+  if (!canApi) {
     throw new Error(
-      r.delivery === "metadata_only"
-        ? "Este plantão foi registrado só com dados (sem PDF). Configure Supabase/API no servidor ou Firebase Storage (Blaze)."
-        : "Não foi possível localizar o PDF (Storage Firebase, rota API ou configuração). Gere de novo no app ou defina VITE_API_BASE_URL / VITE_EXTERNAL_API_BASE_URL.",
+      "Não foi possível localizar o PDF. Com Supabase: defina VITE_API_BASE_URL ou VITE_EXTERNAL_API_BASE_URL no Hosting para falar com o Render (onde está o download). Opcional: legado com PDF só no Firebase Storage.",
     );
   }
 
-  return await fetchShiftReportPdfFromApiBlob(r);
+  throw new Error(
+    "Não foi possível obter o PDF pela API (Supabase no servidor) nem pelo Storage legado. Confirme deploy do Render, variáveis SUPABASE_* no backend e regenere o relatório se precisar.",
+  );
 }
 
 export async function trashShiftReportFirestore(reportId: string): Promise<void> {

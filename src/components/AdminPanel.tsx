@@ -1308,7 +1308,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ profile, onClose, logAdm
                                       </p>
                                       {r.delivery === 'metadata_only' && (
                                         <p className="text-[10px] text-amber-400/90 mt-1 font-bold uppercase tracking-wide">
-                                          Registro sem PDF no Firebase — configure Storage ou API para anexar arquivo.
+                                          Registro sem PDF anexado — use o backend (Render) com Supabase Storage (SUPABASE_*) e a rota de upload, ou o fluxo legado com API/Firebase Storage.
                                         </p>
                                       )}
                                       <p className="text-[11px] text-slate-500 mt-1">

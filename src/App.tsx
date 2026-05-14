@@ -257,11 +257,11 @@ const Button = ({
   size?: 'sm' | 'md' | 'lg';
 }) => {
   const variants = {
-    primary: 'bg-blue-900 text-white hover:bg-blue-800 shadow-md',
-    secondary: 'bg-gray-700 text-white hover:bg-gray-600',
-    outline: 'border-2 border-blue-900 text-blue-900 hover:bg-blue-50',
+    primary: 'bg-blue-600 text-white hover:bg-blue-500 shadow-lg shadow-blue-900/30',
+    secondary: 'bg-slate-700 text-white hover:bg-slate-600',
+    outline: 'border-2 border-white/25 text-white hover:bg-white/10',
     danger: 'bg-red-600 text-white hover:bg-red-700',
-    ghost: 'text-gray-600 hover:bg-gray-100'
+    ghost: 'text-slate-400 hover:bg-slate-800/80 hover:text-white',
   };
   const sizes = {
     sm: 'px-3 py-1.5 text-sm',
@@ -285,7 +285,14 @@ const Button = ({
 };
 
 const Card = ({ children, className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (
-  <div className={cn('bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden', className)} {...props}>
+  <div
+    className={cn(
+      'rounded-2xl border backdrop-blur-sm overflow-hidden',
+      'bg-slate-800/55 border-slate-700/90 shadow-xl shadow-black/25',
+      className,
+    )}
+    {...props}
+  >
     {children}
   </div>
 );
@@ -308,10 +315,10 @@ const Input = ({ label, icon: Icon, ...props }: React.InputHTMLAttributes<HTMLIn
 
 const Badge = ({ children, variant = 'info', className }: { children: React.ReactNode; variant?: 'success' | 'warning' | 'error' | 'info'; className?: string }) => {
   const variants = {
-    success: 'bg-green-100 text-green-700',
-    warning: 'bg-yellow-100 text-yellow-700',
-    error: 'bg-red-100 text-red-700',
-    info: 'bg-blue-100 text-blue-700'
+    success: 'bg-emerald-500/15 text-emerald-300 border border-emerald-500/25',
+    warning: 'bg-amber-500/15 text-amber-200 border border-amber-500/25',
+    error: 'bg-red-500/15 text-red-300 border border-red-500/25',
+    info: 'bg-blue-500/15 text-blue-200 border border-blue-500/25',
   };
   return (
     <span className={cn('px-2 py-0.5 rounded-full text-xs font-semibold', variants[variant], className)}>
@@ -3028,7 +3035,7 @@ function App() {
             <p className="text-gray-500 mt-1">Olá, {user.displayName}! Complete seus dados para acessar o sistema.</p>
           </div>
 
-          <Card className="p-8">
+          <Card className="p-8 !bg-white !border-gray-200 !shadow-xl rounded-2xl">
             <form onSubmit={handleCompleteGoogleRegistration} className="space-y-5">
               <Input 
                 name="name"
@@ -3110,7 +3117,7 @@ function App() {
             <p className="text-gray-500 mt-1">Gestão e Monitoramento Avançado</p>
           </div>
 
-          <Card className="p-8">
+          <Card className="p-8 !bg-white !border-gray-200 !shadow-xl rounded-2xl">
             <form onSubmit={handleLogin} className="space-y-5">
               {isRegistering && (
                 <>
@@ -3276,7 +3283,7 @@ function App() {
   }
 
   return (
-    <div className="min-h-dvh bg-gray-50 pb-24 safe-pb">
+    <div className="min-h-dvh bg-slate-950 text-slate-200 pb-24 safe-pb">
       <AnimatePresence>
         {showAdminPanel && (profile || user?.email === SUPER_ADMIN_EMAIL) && (
           <React.Suspense fallback={null}>
@@ -3290,7 +3297,7 @@ function App() {
       </AnimatePresence>
       {/* Header */}
       <header className={cn(
-        "bg-blue-900 text-white p-4 sm:p-6 rounded-b-3xl sm:rounded-b-[2.5rem] shadow-lg sticky top-0 z-[1000] transition-all duration-300",
+        "text-white p-4 sm:p-6 rounded-b-3xl sm:rounded-b-[2.5rem] shadow-2xl sticky top-0 z-[1000] transition-all duration-300 border-b border-white/10 bg-gradient-to-br from-slate-950 via-blue-950 to-slate-900",
         activeTab === 'map' ? "p-3 sm:p-4 rounded-b-none" : "p-4 sm:p-6 rounded-b-3xl sm:rounded-b-[2.5rem]",
         isHeaderCollapsed ? "py-2 sm:py-3 overflow-hidden" : undefined
       )}>
@@ -3592,7 +3599,7 @@ function App() {
       )}
 
       {/* Main Content */}
-      <main className="p-3 sm:p-6 max-w-4xl mx-auto space-y-4 sm:space-y-6">
+      <main className="p-3 sm:p-6 max-w-4xl mx-auto space-y-4 sm:space-y-6 text-slate-200">
         
         {activeTab === 'home' && (
           <motion.div 
@@ -3606,32 +3613,32 @@ function App() {
                 onClick={() => {
                   void openQrScanner();
                 }}
-                className="flex flex-col items-center justify-center p-6 bg-white rounded-2xl shadow-sm border border-gray-100 hover:border-blue-900 transition-all group"
+                className="flex flex-col items-center justify-center p-6 rounded-2xl border border-slate-700/80 bg-slate-800/40 hover:bg-slate-800/70 hover:border-blue-500/50 transition-all group shadow-lg shadow-black/20"
               >
-                <div className="p-3 bg-blue-50 rounded-xl mb-3 group-hover:bg-blue-900 group-hover:text-white transition-all">
-                  <QrCode className="w-8 h-8" />
+                <div className="p-3 bg-blue-500/15 rounded-xl mb-3 ring-1 ring-blue-500/30 group-hover:bg-blue-600 group-hover:text-white transition-all">
+                  <QrCode className="w-8 h-8 text-blue-300" />
                 </div>
-                <span className="font-bold text-gray-800">Escanear QR</span>
-                <span className="text-xs text-gray-400">Registrar Ronda</span>
+                <span className="font-bold text-white">Escanear QR</span>
+                <span className="text-xs text-slate-500">Registrar Ronda</span>
               </button>
 
               <button 
                 onClick={() => {
                   setShowOccurrenceModal(true);
                 }}
-                className="flex flex-col items-center justify-center p-6 bg-white rounded-2xl shadow-sm border border-gray-100 hover:border-red-600 transition-all group"
+                className="flex flex-col items-center justify-center p-6 rounded-2xl border border-slate-700/80 bg-slate-800/40 hover:bg-slate-800/70 hover:border-red-500/40 transition-all group shadow-lg shadow-black/20"
               >
-                <div className="p-3 bg-red-50 rounded-xl mb-3 group-hover:bg-red-600 group-hover:text-white transition-all">
-                  <AlertTriangle className="w-8 h-8 text-red-600 group-hover:text-white" />
+                <div className="p-3 bg-red-500/15 rounded-xl mb-3 ring-1 ring-red-500/30 group-hover:bg-red-600 group-hover:text-white transition-all">
+                  <AlertTriangle className="w-8 h-8 text-red-400 group-hover:text-white" />
                 </div>
-                <span className="font-bold text-gray-800">Ocorrência</span>
-                <span className="text-xs text-gray-400">Relato Operacional</span>
+                <span className="font-bold text-white">Ocorrência</span>
+                <span className="text-xs text-slate-500">Relato Operacional</span>
               </button>
             </div>
 
             <Button 
               variant="outline" 
-              className="w-full bg-white" 
+              className="w-full border-amber-500/40 text-amber-200 hover:bg-amber-500/10" 
               size="lg"
               onClick={() => {
                 void generateEndOfShiftReport();
@@ -3644,22 +3651,22 @@ function App() {
             {/* Recent History */}
             <div className="space-y-4">
               <div className="flex items-center justify-between">
-                <h3 className="font-bold text-gray-900 flex items-center gap-2">
-                  <History className="w-5 h-5 text-blue-900" />
+                <h3 className="font-bold text-white flex items-center gap-2">
+                  <History className="w-5 h-5 text-amber-400" />
                   Rondas Recentes
                 </h3>
-                <button onClick={() => setActiveTab('history')} className="text-blue-900 text-sm font-semibold">Ver tudo</button>
+                <button onClick={() => setActiveTab('history')} className="text-amber-400 text-sm font-semibold hover:text-amber-300">Ver tudo</button>
               </div>
 
               <div className="space-y-3">
                 {groupByDay<PatrolRecord>(patrols.slice(0, 5)).map((group) => (
                   <div key={group.key} className="space-y-2">
                     <div className="flex items-center gap-2">
-                      <div className="h-px flex-1 bg-gray-200" />
-                      <span className="text-[11px] font-bold uppercase tracking-wider text-gray-400 whitespace-nowrap">
+                      <div className="h-px flex-1 bg-slate-700" />
+                      <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500 whitespace-nowrap">
                         {group.label}
                       </span>
-                      <div className="h-px flex-1 bg-gray-200" />
+                      <div className="h-px flex-1 bg-slate-700" />
                     </div>
                     {group.items.map((patrol) => {
                       const irr = patrolEffectiveValidationStatus(patrol) === 'FORA_DO_RAIO';
@@ -3668,31 +3675,31 @@ function App() {
                         <div className="flex items-center gap-3">
                           <div className={cn(
                             'w-10 h-10 rounded-full flex items-center justify-center',
-                            irr ? 'bg-amber-50' : 'bg-green-50',
+                            irr ? 'bg-amber-500/15 ring-1 ring-amber-500/30' : 'bg-emerald-500/15 ring-1 ring-emerald-500/30',
                           )}>
                             {irr ? (
-                              <AlertTriangle className="w-6 h-6 text-amber-600" />
+                              <AlertTriangle className="w-6 h-6 text-amber-400" />
                             ) : (
-                              <CheckCircle2 className="w-6 h-6 text-green-600" />
+                              <CheckCircle2 className="w-6 h-6 text-emerald-400" />
                             )}
                           </div>
                           <div>
-                            <h4 className="font-bold text-gray-900">{patrol.propertyName}</h4>
-                            <p className="text-xs text-blue-600 font-mono font-bold mt-0.5">{patrol.plusCode}</p>
-                            <p className="text-xs text-gray-500 mt-1">{format(new Date(patrol.timestamp), 'HH:mm')} • {patrol.vehicleId}</p>
+                            <h4 className="font-bold text-white">{patrol.propertyName}</h4>
+                            <p className="text-xs text-sky-400 font-mono font-bold mt-0.5">{patrol.plusCode}</p>
+                            <p className="text-xs text-slate-500 mt-1">{format(new Date(patrol.timestamp), 'HH:mm')} • {patrol.vehicleId}</p>
                             {irr && (
-                              <p className="text-[10px] font-black text-amber-700 uppercase mt-1">Fora do raio</p>
+                              <p className="text-[10px] font-black text-amber-400 uppercase mt-1">Fora do raio</p>
                             )}
                           </div>
                         </div>
-                        <ChevronRight className="w-5 h-5 text-gray-300" />
+                        <ChevronRight className="w-5 h-5 text-slate-600" />
                       </Card>
                     );})}
                   </div>
                 ))}
                 {patrols.length === 0 && (
-                  <div className="text-center py-12 bg-white rounded-2xl border border-dashed border-gray-200">
-                    <p className="text-gray-400">Nenhuma ronda registrada hoje.</p>
+                  <div className="text-center py-12 rounded-2xl border border-dashed border-slate-700 bg-slate-900/40">
+                    <p className="text-slate-500">Nenhuma ronda registrada hoje.</p>
                   </div>
                 )}
               </div>
@@ -3707,13 +3714,13 @@ function App() {
             className="space-y-4"
           >
             <div className="flex items-center justify-between">
-              <h3 className="text-xl font-bold text-gray-900">Histórico Completo</h3>
-              <div className="flex bg-gray-100 p-1 rounded-xl">
+              <h3 className="text-xl font-bold text-white">Histórico Completo</h3>
+              <div className="flex bg-slate-800/90 p-1 rounded-xl ring-1 ring-slate-700/80">
                 <button 
                   onClick={() => setHistoryTab('patrols')}
                   className={cn(
                     "px-4 py-1.5 text-xs font-bold rounded-lg transition-all",
-                    historyTab === 'patrols' ? "bg-white text-blue-900 shadow-sm" : "text-gray-500"
+                    historyTab === 'patrols' ? "bg-slate-700 text-amber-400 shadow-md ring-1 ring-amber-500/30" : "text-slate-500 hover:text-slate-300"
                   )}
                 >
                   Rondas
@@ -3722,7 +3729,7 @@ function App() {
                   onClick={() => setHistoryTab('occurrences')}
                   className={cn(
                     "px-4 py-1.5 text-xs font-bold rounded-lg transition-all",
-                    historyTab === 'occurrences' ? "bg-white text-red-600 shadow-sm" : "text-gray-500"
+                    historyTab === 'occurrences' ? "bg-slate-700 text-red-400 shadow-md ring-1 ring-red-500/30" : "text-slate-500 hover:text-slate-300"
                   )}
                 >
                   Ocorrências
@@ -3734,11 +3741,11 @@ function App() {
               {historyTab === 'patrols' ? (
                 groupByDay<PatrolRecord>(patrols).map((group) => (
                   <div key={group.key} className="space-y-2">
-                    <div className="flex items-center gap-2 sticky top-0 bg-gray-50/80 backdrop-blur-sm py-2 z-10">
-                      <span className="text-xs font-bold text-gray-500 uppercase tracking-wider">
+                    <div className="flex items-center gap-2 sticky top-0 bg-slate-950/90 backdrop-blur-md py-2 z-10 border-b border-slate-800/80">
+                      <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">
                         {group.label}
                       </span>
-                      <div className="h-px flex-1 bg-gray-200" />
+                      <div className="h-px flex-1 bg-slate-700" />
                     </div>
                     {group.items.map((patrol) => (
                       <Card
@@ -3746,17 +3753,17 @@ function App() {
                         className={cn(
                           'p-4 border-l-4',
                           patrolEffectiveValidationStatus(patrol) === 'FORA_DO_RAIO'
-                            ? 'border-l-amber-500 bg-amber-50/30'
+                            ? 'border-l-amber-500 bg-amber-500/5'
                             : 'border-l-transparent',
                         )}
                       >
                         <div className="flex justify-between items-start mb-2">
                           <div>
-                            <h4 className="font-bold text-gray-900">{patrol.propertyName}</h4>
-                            <p className="text-xs text-blue-600 font-mono font-bold mt-0.5">{patrol.plusCode}</p>
-                            <p className="text-sm text-gray-500 mt-1">{format(new Date(patrol.timestamp), 'dd/MM/yyyy HH:mm')}</p>
+                            <h4 className="font-bold text-white">{patrol.propertyName}</h4>
+                            <p className="text-xs text-sky-400 font-mono font-bold mt-0.5">{patrol.plusCode}</p>
+                            <p className="text-sm text-slate-500 mt-1">{format(new Date(patrol.timestamp), 'dd/MM/yyyy HH:mm')}</p>
                             {patrolEffectiveValidationStatus(patrol) === 'FORA_DO_RAIO' && typeof patrol.distanceMeters === 'number' && (
-                              <p className="text-[11px] font-bold text-amber-700 mt-1">
+                              <p className="text-[11px] font-bold text-amber-400 mt-1">
                                 Antifraude: ~{patrol.distanceMeters} m do posto (limite {patrol.allowedRadiusMeters ?? 50} m)
                               </p>
                             )}
@@ -3771,21 +3778,21 @@ function App() {
                           </div>
                         </div>
                         <div className="flex items-center justify-between mt-4">
-                          <div className="flex items-center gap-4 text-xs text-gray-400">
+                          <div className="flex items-center gap-4 text-xs text-slate-500">
                             <span className="flex items-center gap-1"><User className="w-3 h-3" /> {patrol.agentName}</span>
                             <span className="flex items-center gap-1"><Truck className="w-3 h-3" /> {patrol.vehicleId}</span>
                           </div>
                           <Button 
                             size="sm" 
                             variant="ghost" 
-                            className="h-8 text-blue-900 hover:bg-blue-50"
+                            className="h-8 text-sky-400 hover:bg-white/10"
                             onClick={() => window.open(`https://www.google.com/maps/search/?api=1&query=${patrol.latitude},${patrol.longitude}`, '_blank')}
                           >
                             <MapPin className="w-3 h-3 mr-1" />
                             Ver no Mapa
                           </Button>
                         </div>
-                        <p className="mt-2 text-sm text-gray-600 italic">"{patrol.observation}"</p>
+                        <p className="mt-2 text-sm text-slate-400 italic">"{patrol.observation}"</p>
                       </Card>
                     ))}
                   </div>
@@ -3793,41 +3800,41 @@ function App() {
               ) : (
                 groupByDay<OccurrenceRecord>(occurrences).map((group) => (
                   <div key={group.key} className="space-y-2">
-                    <div className="flex items-center gap-2 sticky top-0 bg-gray-50/80 backdrop-blur-sm py-2 z-10">
-                      <span className="text-xs font-bold text-gray-500 uppercase tracking-wider">
+                    <div className="flex items-center gap-2 sticky top-0 bg-slate-950/90 backdrop-blur-md py-2 z-10 border-b border-slate-800/80">
+                      <span className="text-xs font-bold text-slate-500 uppercase tracking-wider">
                         {group.label}
                       </span>
-                      <div className="h-px flex-1 bg-gray-200" />
+                      <div className="h-px flex-1 bg-slate-700" />
                     </div>
                     {group.items.map((occ) => (
                       <Card key={occ.id} className="p-4 border-l-4 border-l-red-500">
                         <div className="flex justify-between items-start mb-2">
                           <div>
-                            <h4 className="font-bold text-gray-900">{occ.type}</h4>
-                            <p className="text-xs text-red-600 font-bold mt-0.5">{occ.propertyName || 'Local não informado'}</p>
-                            <p className="text-sm text-gray-500 mt-1">{format(new Date(occ.timestamp), 'dd/MM/yyyy HH:mm')}</p>
+                            <h4 className="font-bold text-white">{occ.type}</h4>
+                            <p className="text-xs text-red-400 font-bold mt-0.5">{occ.propertyName || 'Local não informado'}</p>
+                            <p className="text-sm text-slate-500 mt-1">{format(new Date(occ.timestamp), 'dd/MM/yyyy HH:mm')}</p>
                           </div>
                           <Badge variant="error">OCORRÊNCIA</Badge>
                         </div>
                         
-                        <p className="mt-2 text-sm text-gray-700 bg-gray-50 p-3 rounded-lg border border-gray-100">
+                        <p className="mt-2 text-sm text-slate-300 bg-slate-900/50 p-3 rounded-lg border border-slate-700/80">
                           {occ.description}
                         </p>
 
                         {occ.photoUrl && (
-                          <div className="mt-3 rounded-xl overflow-hidden border border-gray-200">
+                          <div className="mt-3 rounded-xl overflow-hidden border border-slate-700">
                             <img src={occ.photoUrl} alt="Evidência" className="w-full h-48 object-cover" />
                           </div>
                         )}
 
                         <div className="flex items-center justify-between mt-4">
-                          <div className="flex items-center gap-4 text-xs text-gray-400">
+                          <div className="flex items-center gap-4 text-xs text-slate-500">
                             <span className="flex items-center gap-1"><User className="w-3 h-3" /> {occ.agentName}</span>
                           </div>
                           <Button 
                             size="sm" 
                             variant="ghost" 
-                            className="h-8 text-red-600 hover:bg-red-50"
+                            className="h-8 text-red-400 hover:bg-red-500/10"
                             onClick={() => window.open(`https://www.google.com/maps/search/?api=1&query=${occ.latitude},${occ.longitude}`, '_blank')}
                           >
                             <MapPin className="w-3 h-3 mr-1" />
@@ -3840,8 +3847,8 @@ function App() {
                 ))
               )}
               {((historyTab === 'patrols' && patrols.length === 0) || (historyTab === 'occurrences' && occurrences.length === 0)) && (
-                <div className="text-center py-12 bg-white rounded-2xl border border-dashed border-gray-200">
-                  <p className="text-gray-400">Nenhum registro encontrado.</p>
+                <div className="text-center py-12 rounded-2xl border border-dashed border-slate-700 bg-slate-900/40">
+                  <p className="text-slate-500">Nenhum registro encontrado.</p>
                 </div>
               )}
             </div>
@@ -3853,7 +3860,7 @@ function App() {
           <motion.div 
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
-            className="space-y-6 pb-20"
+            className="space-y-6 pb-20 -mx-3 sm:-mx-6"
           >
             <React.Suspense fallback={null}>
               <StrategicDashboard 
@@ -3881,7 +3888,7 @@ function App() {
             className="space-y-4"
           >
             <div className="flex items-center justify-between">
-              <h3 className="text-xl font-bold text-gray-900">Próprios Públicos</h3>
+              <h3 className="text-xl font-bold text-white">Próprios Públicos</h3>
               <div className="flex gap-2">
                 {isMasterAdmin && (
                   <>
@@ -3902,11 +3909,11 @@ function App() {
 
             <div className="space-y-3">
               <div className="relative">
-                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400" />
+                <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-500" />
                 <input 
                   type="text"
                   placeholder="Pesquisar por nome..."
-                  className="w-full bg-white border border-gray-200 rounded-xl py-2.5 pl-10 pr-4 outline-none focus:ring-2 focus:ring-blue-900/20"
+                  className="w-full bg-slate-900/60 border border-slate-700 rounded-xl py-2.5 pl-10 pr-4 text-white placeholder:text-slate-500 outline-none focus:ring-2 focus:ring-amber-500/30"
                   value={propertySearch}
                   onChange={(e) => setPropertySearch(e.target.value)}
                 />
@@ -3920,8 +3927,8 @@ function App() {
                     className={cn(
                       'px-4 py-1.5 rounded-full text-xs font-bold whitespace-nowrap transition-all',
                       propertyCategory === cat 
-                        ? 'bg-blue-900 text-white' 
-                        : 'bg-gray-100 text-gray-500 hover:bg-gray-200'
+                        ? 'bg-amber-500/20 text-amber-300 ring-1 ring-amber-500/40' 
+                        : 'bg-slate-800/80 text-slate-400 hover:bg-slate-800 ring-1 ring-slate-700/60'
                     )}
                   >
                     {cat === 'all' ? 'Todos' : 
@@ -3940,11 +3947,11 @@ function App() {
             
             <div className="grid gap-4">
               {properties.length === 0 && (
-                <div className="text-center py-12 bg-gray-50 rounded-2xl border-2 border-dashed border-gray-200">
-                  <MapIcon className="w-12 h-12 text-gray-300 mx-auto mb-4" />
-                  <p className="text-gray-500 font-medium">Nenhum local cadastrado.</p>
+                <div className="text-center py-12 rounded-2xl border-2 border-dashed border-slate-700 bg-slate-900/40">
+                  <MapIcon className="w-12 h-12 text-slate-600 mx-auto mb-4" />
+                  <p className="text-slate-400 font-medium">Nenhum local cadastrado.</p>
                   {profile?.role === 'agent' && (
-                    <p className="text-xs text-gray-400 mt-1">Aguardando sincronização pelo Comando ou Supervisor.</p>
+                    <p className="text-xs text-slate-500 mt-1">Aguardando sincronização pelo Comando ou Supervisor.</p>
                   )}
                 </div>
               )}
@@ -3957,23 +3964,23 @@ function App() {
                 .map(prop => (
                 <Card 
                   key={prop.id} 
-                  className="p-4 cursor-pointer hover:border-blue-900/30 transition-all active:scale-[0.98]"
+                  className="p-4 cursor-pointer hover:border-amber-500/40 transition-all active:scale-[0.98]"
                   onClick={() => setSelectedPropertyForQR(prop)}
                 >
                   <div className="flex items-start justify-between mb-3">
                     <div>
                       <Badge variant="info" className="mb-1">{prop.category}</Badge>
-                      <h4 className="font-bold text-gray-900">{prop.name}</h4>
-                      <p className="text-[10px] text-gray-500 flex items-center gap-1">
+                      <h4 className="font-bold text-white">{prop.name}</h4>
+                      <p className="text-[10px] text-slate-500 flex items-center gap-1">
                         <MapPin className="w-3 h-3" /> {prop.address}
                       </p>
                     </div>
                     <div className="text-right flex flex-col items-end gap-2">
                       <div>
-                        <p className="text-[10px] text-gray-400 uppercase font-bold">Status</p>
+                        <p className="text-[10px] text-slate-500 uppercase font-bold">Status</p>
                         <span className={cn(
                           'text-[10px] font-bold px-2 py-0.5 rounded-full',
-                          prop.status === 'operational' ? 'bg-green-100 text-green-700' : 'bg-yellow-100 text-yellow-700'
+                          prop.status === 'operational' ? 'bg-emerald-500/15 text-emerald-300 ring-1 ring-emerald-500/30' : 'bg-amber-500/15 text-amber-200 ring-1 ring-amber-500/30'
                         )}>
                           {prop.status === 'operational' ? 'OPERACIONAL' : 'MANUTENÇÃO'}
                         </span>
@@ -3985,7 +3992,7 @@ function App() {
                               e.stopPropagation();
                               handleEditProperty(prop);
                             }}
-                            className="p-1.5 bg-gray-100 text-gray-600 rounded-lg hover:bg-blue-100 hover:text-blue-900 transition-all"
+                            className="p-1.5 bg-slate-800 text-slate-300 rounded-lg hover:bg-blue-500/20 hover:text-sky-300 transition-all ring-1 ring-slate-700"
                             title="Editar posto"
                           >
                             <Edit2 className="w-3.5 h-3.5" />
@@ -3995,7 +4002,7 @@ function App() {
                               e.stopPropagation();
                               handleDeleteProperty(prop.id, prop.name);
                             }}
-                            className="p-1.5 bg-gray-100 text-gray-600 rounded-lg hover:bg-red-100 hover:text-red-600 transition-all"
+                            className="p-1.5 bg-slate-800 text-slate-300 rounded-lg hover:bg-red-500/20 hover:text-red-300 transition-all ring-1 ring-slate-700"
                             title="Excluir posto"
                           >
                             <Trash2 className="w-3.5 h-3.5" />
@@ -4005,15 +4012,15 @@ function App() {
                     </div>
                   </div>
                   
-                  <div className="flex items-center justify-between pt-3 border-t border-gray-50">
+                  <div className="flex items-center justify-between pt-3 border-t border-slate-700/60">
                     <div className="flex gap-4">
                       <div>
-                        <p className="text-[10px] text-gray-400 uppercase font-bold">QR Code</p>
-                        <code className="text-xs font-mono font-bold text-blue-900">{prop.qrCode}</code>
+                        <p className="text-[10px] text-slate-500 uppercase font-bold">QR Code</p>
+                        <code className="text-xs font-mono font-bold text-sky-400">{prop.qrCode}</code>
                       </div>
                       <div>
-                        <p className="text-[10px] text-gray-400 uppercase font-bold">Coordenadas</p>
-                        <p className="text-[10px] font-mono text-gray-600">{prop.latitude.toFixed(4)}, {prop.longitude.toFixed(4)}</p>
+                        <p className="text-[10px] text-slate-500 uppercase font-bold">Coordenadas</p>
+                        <p className="text-[10px] font-mono text-slate-400">{prop.latitude.toFixed(4)}, {prop.longitude.toFixed(4)}</p>
                       </div>
                     </div>
                     <Button size="sm" variant="ghost" className="h-8 w-8 p-0">
@@ -4033,7 +4040,7 @@ function App() {
             className="space-y-4"
           >
             <div className="flex items-center justify-between">
-              <h3 className="text-xl font-bold text-gray-900">Gestão de Equipes</h3>
+              <h3 className="text-xl font-bold text-white">Gestão de Equipes</h3>
               <Button size="sm" onClick={() => setShowTeamVehicleSetup(true)}>
                 <Plus className="w-4 h-4" /> Nova Escala
               </Button>
@@ -4044,27 +4051,27 @@ function App() {
                 <Card key={team.id} className="p-4">
                   <div className="flex items-start justify-between">
                     <div className="flex items-start gap-3">
-                      <div className="p-3 bg-blue-50 rounded-xl">
-                        <Users className="w-6 h-6 text-blue-900" />
+                      <div className="p-3 bg-blue-500/15 rounded-xl ring-1 ring-blue-500/25">
+                        <Users className="w-6 h-6 text-sky-400" />
                       </div>
                       <div>
                         <div className="flex items-center gap-2 mb-1">
-                          <h4 className="font-bold text-gray-900">{team.name}</h4>
+                          <h4 className="font-bold text-white">{team.name}</h4>
                           <Badge variant={team.active ? 'success' : 'info'} className="text-[8px] px-1.5 py-0">
                             {team.active ? 'ATIVA' : 'INATIVA'}
                           </Badge>
                         </div>
-                        <p className="text-xs text-gray-500 font-medium mb-2">VTR: {team.vehiclePrefix} • {team.shift}</p>
+                        <p className="text-xs text-slate-500 font-medium mb-2">VTR: {team.vehiclePrefix} • {team.shift}</p>
                         
                         <div className="grid grid-cols-2 gap-x-4 gap-y-1">
-                          <p className="text-[10px] text-gray-400 font-bold uppercase">Condutor: <span className="text-gray-700 font-medium normal-case">{team.driver}</span></p>
-                          <p className="text-[10px] text-gray-400 font-bold uppercase">Encarregado: <span className="text-gray-700 font-medium normal-case">{team.inCharge}</span></p>
-                          {team.aux1 && <p className="text-[10px] text-gray-400 font-bold uppercase">Aux 01: <span className="text-gray-700 font-medium normal-case">{team.aux1}</span></p>}
-                          {team.aux2 && <p className="text-[10px] text-gray-400 font-bold uppercase">Aux 02: <span className="text-gray-700 font-medium normal-case">{team.aux2}</span></p>}
+                          <p className="text-[10px] text-slate-500 font-bold uppercase">Condutor: <span className="text-slate-300 font-medium normal-case">{team.driver}</span></p>
+                          <p className="text-[10px] text-slate-500 font-bold uppercase">Encarregado: <span className="text-slate-300 font-medium normal-case">{team.inCharge}</span></p>
+                          {team.aux1 && <p className="text-[10px] text-slate-500 font-bold uppercase">Aux 01: <span className="text-slate-300 font-medium normal-case">{team.aux1}</span></p>}
+                          {team.aux2 && <p className="text-[10px] text-slate-500 font-bold uppercase">Aux 02: <span className="text-slate-300 font-medium normal-case">{team.aux2}</span></p>}
                         </div>
                       </div>
                     </div>
-                    <span className="text-[10px] text-gray-400 font-medium">
+                    <span className="text-[10px] text-slate-500 font-medium">
                       {team.createdAt ? format(new Date(team.createdAt), 'dd/MM/yy') : ''}
                     </span>
                   </div>
@@ -4081,7 +4088,7 @@ function App() {
             className="space-y-4"
           >
             <div className="flex items-center justify-between">
-              <h3 className="text-xl font-bold text-gray-900">Gestão de Viaturas</h3>
+              <h3 className="text-xl font-bold text-white">Gestão de Viaturas</h3>
               <Button size="sm" onClick={() => setShowTeamVehicleSetup(true)}>
                 <Plus className="w-4 h-4" /> Nova Viatura
               </Button>
@@ -4092,13 +4099,13 @@ function App() {
                 <Card key={v.id} className="p-4">
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
-                      <div className="p-3 bg-blue-50 rounded-xl">
-                        <Truck className="w-6 h-6 text-blue-900" />
+                      <div className="p-3 bg-amber-500/10 rounded-xl ring-1 ring-amber-500/25">
+                        <Truck className="w-6 h-6 text-amber-400" />
                       </div>
                       <div>
-                        <h4 className="font-bold text-gray-900">{v.prefix}</h4>
-                        <p className="text-xs text-gray-500">{v.model} • {v.plate}</p>
-                        <p className="text-[10px] text-blue-600 font-bold uppercase mt-1">{v.type}</p>
+                        <h4 className="font-bold text-white">{v.prefix}</h4>
+                        <p className="text-xs text-slate-500">{v.model} • {v.plate}</p>
+                        <p className="text-[10px] text-sky-400 font-bold uppercase mt-1">{v.type}</p>
                       </div>
                     </div>
                     <div className="text-right">
@@ -4122,7 +4129,7 @@ function App() {
       </main>
 
       {/* Bottom Navigation */}
-      <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-100 px-4 py-3 safe-pb flex items-center justify-between z-40 overflow-x-auto scrollbar-hide">
+      <nav className="fixed bottom-0 left-0 right-0 bg-slate-950/95 backdrop-blur-md border-t border-slate-800/90 px-4 py-3 safe-pb flex items-center justify-between z-40 overflow-x-auto scrollbar-hide shadow-[0_-8px_32px_rgba(0,0,0,0.45)]">
         <NavButton active={activeTab === 'home'} onClick={() => setActiveTab('home')} icon={Home} label="Início" />
         <NavButton active={activeTab === 'map'} onClick={() => setActiveTab('map')} icon={MapIcon} label="Mapa" />
         <NavButton active={activeTab === 'history'} onClick={() => setActiveTab('history')} icon={History} label="Rondas" />
@@ -5218,13 +5225,13 @@ const NavButton = ({ active, onClick, icon: Icon, label }: { active: boolean; on
   <button 
     onClick={onClick}
     className={cn(
-      'flex flex-col items-center gap-1 transition-all',
-      active ? 'text-blue-900' : 'text-gray-400'
+      'flex flex-col items-center gap-1 transition-all min-w-[3.25rem]',
+      active ? 'text-amber-400' : 'text-slate-500 hover:text-slate-300'
     )}
   >
     <div className={cn(
       'p-2 rounded-xl transition-all',
-      active ? 'bg-blue-50' : 'bg-transparent'
+      active ? 'bg-amber-500/15 ring-1 ring-amber-500/40 shadow-lg shadow-amber-900/20' : 'bg-transparent hover:bg-slate-800/80'
     )}>
       <Icon className="w-6 h-6" />
     </div>
