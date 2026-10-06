@@ -299,3 +299,30 @@ A licença do projeto não está definida neste README. Consulte o proprietário
 ## Status
 
 Este README documenta a estrutura e os principais recursos identificados no código atual do repositório. À medida que novas funcionalidades forem adicionadas, a documentação deve ser atualizada junto com o código.
+
+
+## PWA — instalação no smartphone e desktop
+
+O SIGMA-GCM também é publicado como **PWA (Progressive Web App)** na versão web.
+
+A implementação inclui:
+
+- manifest.webmanifest com nome, ícone, tema, modo standalone e escopo do aplicativo;
+- Service Worker para cache do shell e fallback da interface quando a rede estiver indisponível;
+- registro automático do Service Worker em produção;
+- botão **Instalar** para Chrome/Edge e navegadores compatíveis;
+- instruções específicas para instalação no iPhone/iPad pelo Safari;
+- ícones próprios do SIGMA-GCM;
+- suporte ao caminho do GitHub Pages /SIGMA-GCM/.
+
+### Como instalar
+
+**Android / Chrome:** abra o endereço publicado e use **Instalar** no aviso do sistema ou no menu do navegador.
+
+**Windows / Edge ou Chrome:** abra o endereço do SIGMA-GCM e selecione **Instalar SIGMA-GCM** na barra de endereço/menu.
+
+**macOS / Chrome ou Edge:** use a opção de instalação do navegador.
+
+**iPhone/iPad:** no Safari, toque em **Compartilhar → Adicionar à Tela de Início**.
+
+> O PWA melhora a experiência de abertura, cache do shell e instalação, mas não transforma automaticamente os recursos que dependem do backend/API em funcionamento offline. Firebase, APIs externas, autenticação e operações de servidor continuam dependendo de conectividade quando exigirem dados remotos.
