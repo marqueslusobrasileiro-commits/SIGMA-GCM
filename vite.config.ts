@@ -17,6 +17,9 @@ export default defineConfig(({mode}) => {
   const strictHosts =
     env.VITE_STRICT_HOSTS === 'true' || process.env.VITE_STRICT_HOSTS === 'true';
   return {
+    // GitHub Pages publica o projeto em /SIGMA-GCM/. Caminho relativo evita que
+    // os assets sejam procurados na raiz do domínio (e também funciona no preview).
+    base: './',
     plugins: [
       react(), 
       tailwindcss(),
