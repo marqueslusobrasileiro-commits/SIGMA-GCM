@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" role="img" aria-label="SIGMA-GCM">
+  <rect width="192" height="192" rx="42" fill="#0f172a"/>
+  <rect x="18" y="18" width="156" height="156" rx="34" fill="#172554"/>
+  <path d="M48 55h96l-17 22H82l-9 12h39c18 0 31 11 31 26 0 14-12 22-31 22H48l17-22h46c5 0 8-2 8-5 0-4-3-6-9-6H48l17-22h58l9-12H48z" fill="#fbbf24"/>
+  <text x="96" y="154" text-anchor="middle" font-family="Arial,sans-serif" font-size="13" font-weight="700" letter-spacing="2" fill="#e2e8f0">GCM</text>
+</svg>
