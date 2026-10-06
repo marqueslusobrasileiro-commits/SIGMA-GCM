@@ -383,22 +383,29 @@ export function registerShiftReportRoutes(app: express.Express) {
       return res.status(403).json({ error: "forbidden" });
     }
 
-    if (!isSupabaseShiftReportsConfigured()) {
-      return res.status(503).json({ error: "Supabase não configurado no servidor." });
-    }
+    const supabaseConfigured = isSupabaseShiftReportsConfigured();
 
-    // eslint-disable-next-line no-console
+    // O endpoint atende relatórios atuais no Supabase e relatórios antigos
+    // que ainda estejam no Firebase Storage.
     console.log("[shift-reports] file GET", {
       reportId,
       delivery: data?.delivery,
-      bucket: supabaseShiftReportsBucket(),
+      supabaseConfigured,
+      bucket: supabaseConfigured ? supabaseShiftReportsBucket() : null,
     });
 
-    const buf = await downloadShiftReportPdfBuffer({ reportId, data });
+    let buf = supabaseConfigured
+      ? await downloadShiftReportPdfBuffer({ reportId, data })
+      : null;
+
+    if (!buf?.length) {
+      buf = await downloadShiftReportPdfFromFirebase({ reportId, data });
+    }
+
     if (!buf?.length) {
       return res.status(404).json({
         error:
-          "PDF não encontrado no Supabase. Confirme storagePath no Firestore, o bucket e regenere o relatório.",
+          "PDF não encontrado nem no Supabase Storage nem no Firebase Storage legado. Verifique os buckets e o relatório.",
       });
     }
 
