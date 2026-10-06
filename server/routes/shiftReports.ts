@@ -1,7 +1,7 @@
 import type express from "express";
 import nodemailer from "nodemailer";
 import { FieldValue } from "firebase-admin/firestore";
-import { db } from "../lib/firebaseAdmin";
+import { db, storageBucket } from "../lib/firebaseAdmin";
 import { requireFirebaseAuth } from "../lib/httpAuth";
 import {
   fetchPdfBufferFromSignedUrl,
@@ -106,6 +106,57 @@ function collectSupabaseObjectPaths(reportId: string, data: any): string[] {
 }
 
 /**
+ * Fallback para relatórios antigos que ainda estão no Firebase Storage.
+ * Mantemos os caminhos históricos para não quebrar relatórios já emitidos antes
+ * da migração para o Supabase.
+ */
+async function downloadShiftReportPdfFromFirebase(opts: { reportId: string; data: any }): Promise<Buffer | null> {
+  const { reportId, data } = opts;
+  const candidates: string[] = [];
+  const seen = new Set<string>();
+  const add = (p: string) => {
+    const value = String(p || "").trim();
+    if (!value || seen.has(value)) return;
+    seen.add(value);
+    candidates.push(value);
+  };
+
+  const explicit = String(data?.storagePath || "").trim();
+  if (explicit && !explicit.startsWith("relatorios/")) add(explicit);
+
+  const agentId = String(data?.agentId || "").trim();
+  if (agentId) {
+    add(`shift_reports/${agentId}/${reportId}.pdf`);
+    const ws = String(data?.windowStart || "").trim();
+    if (ws) add(buildRelatorioStoragePath(agentId, reportId, ws));
+  }
+
+  for (const objectPath of candidates) {
+    try {
+      const file = storageBucket.file(objectPath);
+      const [exists] = await file.exists();
+      if (!exists) continue;
+      const [buffer] = await file.download();
+      if (buffer?.length) {
+        console.log("[shift-reports] PDF encontrado no Firebase Storage legado", {
+          reportId,
+          path: objectPath,
+          bytes: buffer.length,
+        });
+        return buffer;
+      }
+    } catch (error) {
+      console.warn("[shift-reports] falha ao consultar Firebase Storage legado", {
+        reportId,
+        path: objectPath,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return null;
+}
+
+/**
  * Obtém o PDF: storagePath (e fallbacks) → createSignedUrl(60s) → fetch da URL assinada → Buffer.
  */
 async function downloadShiftReportPdfBuffer(opts: { reportId: string; data: any }): Promise<Buffer | null> {
@@ -141,6 +192,48 @@ async function readPdfBufferForEmail(opts: { reportId: string; data: any }): Pro
 
   const buf = await downloadShiftReportPdfBuffer(opts);
   if (buf?.length) return buf;
+
+  // Compatibilidade: relatórios antigos podem ter sido gravados no Firebase Storage.
+  const legacyBuf = await downloadShiftReportPdfFromFirebase(opts);
+  if (legacyBuf?.length) {
+    // Recupera automaticamente o objeto no layout atual do Supabase para que
+    // downloads e próximos envios funcionem sem depender do legado.
+    const agentId = String(data?.agentId || "").trim();
+    const windowStartIso = String(data?.windowStart || "").trim();
+    if (agentId && windowStartIso) {
+      const canonicalPath = buildRelatorioStoragePath(agentId, reportId, windowStartIso);
+      const repaired = await uploadShiftReportPdfToSupabase({
+        buffer: legacyBuf,
+        objectPath: canonicalPath,
+        reportId,
+      });
+      if (repaired?.storagePath) {
+        try {
+          await db.collection("shift_reports").doc(reportId).set(
+            {
+              storagePath: repaired.storagePath,
+              delivery: "supabase",
+              uploaded: true,
+              uploadedAt: new Date().toISOString(),
+              supabaseStorageBucket: supabaseShiftReportsBucket(),
+              migratedFrom: "firebase_storage",
+            },
+            { merge: true },
+          );
+          console.log("[shift-reports] PDF legado migrado automaticamente para Supabase", {
+            reportId,
+            storagePath: repaired.storagePath,
+          });
+        } catch (error) {
+          console.warn("[shift-reports] PDF recuperado, mas não foi possível atualizar metadados", {
+            reportId,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    }
+    return legacyBuf;
+  }
 
   const sp = String(data?.storagePath || "").trim();
   const bucket = supabaseShiftReportsBucket();
