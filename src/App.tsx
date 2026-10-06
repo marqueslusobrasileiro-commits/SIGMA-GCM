@@ -44,7 +44,8 @@ import {
   GoogleAuthProvider,
   getRedirectResult,
   signInWithCredential,
-  signInWithCustomToken
+  signInWithCustomToken,
+  signInWithPopup
 } from 'firebase/auth';
 import { Capacitor } from '@capacitor/core';
 import { GoogleSignIn } from '@capawesome/capacitor-google-sign-in';
@@ -1039,53 +1040,12 @@ function App() {
     });
   }, []);
 
-  // Web: login Google via servidor (/api/auth/google → custom token) contorna auth/unauthorized-domain no SDK.
-  // Mantém getRedirectResult só para sessões antigas que ainda usavam signInWithRedirect.
+  // Recupera redirecionamentos antigos do Firebase Auth, sem depender de /api/*.
+  // O fluxo atual da web usa signInWithPopup; este fallback evita deixar estados
+  // antigos de signInWithRedirect presos no navegador.
   useEffect(() => {
     if (Capacitor.isNativePlatform()) return;
-    const params = new URLSearchParams(window.location.search);
-    if (params.get('google_login') === 'error') {
-      setError(
-        'Login Google falhou. Confira no Render: (1) GOOGLE_OAUTH_CLIENT_SECRET — secret do cliente OAuth Web; (2) FIREBASE_SERVICE_ACCOUNT — JSON completo da conta de serviço Firebase (Project settings → Service accounts → Generate new private key), colado como variável de ambiente; (3) no GCP, redirect https://…onrender.com/api/auth/google/callback. Veja Logs do Render para detalhe.',
-      );
-      window.history.replaceState({}, '', window.location.pathname + window.location.hash);
-    }
     void (async () => {
-      try {
-        const completeRes = await fetch('/api/auth/google/complete', { credentials: 'include' });
-        if (completeRes.status === 204) return;
-        const data = await completeRes.json().catch(async () => {
-          const txt = await completeRes.text().catch(() => '');
-          return { error: txt || 'Resposta inválida do servidor.' };
-        });
-        if (completeRes.ok && data?.firebaseCustomToken) {
-          try {
-            const appAny = (auth as any)?.app;
-            const pid = appAny?.options?.projectId;
-            console.info("[auth] firebase web projectId:", pid);
-          } catch {}
-          await signInWithCustomToken(auth, data.firebaseCustomToken);
-          setError(null);
-          return;
-        }
-        if (!completeRes.ok) {
-          console.warn('google web auth complete: non-ok', {
-            status: completeRes.status,
-            statusText: completeRes.statusText,
-            data,
-          });
-          setError(
-            `Login Google não finalizou no servidor (HTTP ${completeRes.status}). ` +
-              `${typeof data?.error === 'string' && data.error ? `Detalhes: ${data.error}` : ''}`.trim(),
-          );
-        }
-      } catch (e) {
-        console.warn('google web auth complete:', e);
-        const msg = e instanceof Error ? e.message : String(e);
-        setError(`Login Google não finalizou (rede/navegador). Detalhes: ${msg}`);
-      }
-      // Na web o login Google é só via servidor; getRedirectResult do SDK costuma dar auth/unauthorized-domain se restou estado antigo.
-      if (Capacitor.getPlatform() === 'web') return;
       try {
         const result = await getRedirectResult(auth);
         if (result?.user) setError(null);
@@ -2096,9 +2056,14 @@ function App() {
   const handleGoogleLogin = async () => {
     try {
       setLoading(true);
-      // getPlatform() === 'web' é mais confiável que !isNativePlatform() (evita cair no fluxo nativo+Firebase no browser e dar auth/unauthorized-domain).
+      // No GitHub Pages não existe o servidor Express em /api/*.
+      // Na web usamos o provedor Google do próprio Firebase Auth; no Android
+      // mantemos o fluxo nativo do Capacitor.
       if (Capacitor.getPlatform() === 'web') {
-        window.location.href = '/api/auth/google/start';
+        const provider = new GoogleAuthProvider();
+        provider.setCustomParameters({ prompt: 'select_account' });
+        await signInWithPopup(auth, provider);
+        setError(null);
         return;
       }
       const result = await GoogleSignIn.signIn();
