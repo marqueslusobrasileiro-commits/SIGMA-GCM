@@ -19,7 +19,7 @@ export default defineConfig(({mode}) => {
   return {
     // GitHub Pages publica o projeto em /SIGMA-GCM/. Caminho relativo evita que
     // os assets sejam procurados na raiz do domínio (e também funciona no preview).
-    base: './',
+    base: '/SIGMA-GCM/',
     plugins: [
       react(), 
       tailwindcss(),
